@@ -397,7 +397,7 @@ Comandos reproducibles verificados en esta entrega:
 
 ```text
 cargo fmt --all
-cargo test --workspace                         # 9 tests Rust: protocolo, sanitización, identidad y payload
+cargo test --workspace                         # 12 tests Rust: protocolo, transiciones, sanitización, identidad y payload
 powershell -ExecutionPolicy Bypass -File installer/scripts/build.ps1
 powershell -ExecutionPolicy Bypass -File installer/scripts/verify.ps1
 dotnet build installer/bundle/Bundle.wixproj -p:Configuration=release
