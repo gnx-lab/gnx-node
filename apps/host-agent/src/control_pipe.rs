@@ -121,7 +121,9 @@ fn run_windows() -> Result<(), Box<dyn std::error::Error>> {
         if unsafe {
             ConnectNamedPipe(pipe, null_mut()) != 0 || GetLastError() == ERROR_PIPE_CONNECTED
         } {
-            serve_client(pipe, &mut current)?;
+            if authorize_client(pipe) {
+                serve_client(pipe, &mut current)?;
+            }
         }
         unsafe {
             DisconnectNamedPipe(pipe);
@@ -134,6 +136,39 @@ fn run_windows() -> Result<(), Box<dyn std::error::Error>> {
         LocalFree(descriptor as _);
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn authorize_client(pipe: windows_sys::Win32::Foundation::HANDLE) -> bool {
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, RevertToSelf, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Pipes::ImpersonateNamedPipeClient;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+    let impersonated = unsafe { ImpersonateNamedPipeClient(pipe) } != 0;
+    if !impersonated {
+        return false;
+    }
+    let mut token = std::ptr::null_mut();
+    let opened = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) } != 0;
+    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut returned = 0u32;
+    let elevated = opened
+        && unsafe {
+            GetTokenInformation(
+                token,
+                TokenElevation,
+                (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut returned,
+            )
+        } != 0
+        && elevation.TokenIsElevated != 0;
+    if opened {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(token) };
+    }
+    unsafe { RevertToSelf() };
+    elevated
 }
 
 #[cfg(windows)]
