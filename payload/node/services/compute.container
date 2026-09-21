@@ -7,11 +7,11 @@ Description=GnX compute capability
 After=mesh.service
 Requires=mesh.service
 [Container]
-Image=registry.gnx.invalid/proxmox@sha256:9a6b4c2d1e0f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b
+Image=docker.io/dockurr/proxmox@sha256:135292c3d3cbc8061ad6c70f1097f213d4de20275d5a1e679de580a254f1018c
 ContainerName=gnx-compute
 Network=host
 AddDevice=/dev/kvm
-PublishPort=127.0.0.1:8006:8006
+Privileged=true
 Volume=/var/lib/gnx-node/compute:/var/lib/gnx-compute:Z
 Volume=/var/lib/gnx-node/ca:/etc/gnx/ca:ro,Z
 [Service]

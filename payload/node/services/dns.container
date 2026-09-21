@@ -6,7 +6,7 @@ Description=GnX private DNS capability
 After=mesh.service
 Requires=mesh.service
 [Container]
-Image=docker.io/pihole/pihole@sha256:7fd7c1c7b0c2a8f5a8db35f7bdf0e4f8f3cf6b5e2d3a1c9e7f5d4b2a1c0e9f8d
+Image=docker.io/pihole/pihole@sha256:5b9c8cf51de7d6d3f2240dbe72baf5f06e1fd39cb4d77a99fab4fa13e23bd1be
 ContainerName=gnx-dns
 Network=host
 Environment=FTLCONF_dns_listeningMode=all

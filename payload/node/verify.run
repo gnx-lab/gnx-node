@@ -1,28 +1,132 @@
 #!/usr/bin/env bash
 # Capacidad: readiness integral de GnX Node
 # Implementación aprobada: Quadlets funcionales y health HTTPS interno
-# Verifica TUN y KVM por separado; su salida JSONL es la única evidencia canónica
+# Verifica TUN y KVM por separado; su salida JSONL es la única evidencia canónica.
 set -Eeuo pipefail
 IFS=$'\n\t'
+
 usage() { printf '%s\n' 'usage: verify.run --state-dir DIR'; }
 state_dir=""
 while (($#)); do
   case "$1" in
-    --state-dir) (($# >= 2)) || exit 64; state_dir=$2; shift 2 ;;
-    --help) usage; exit 0 ;;
+    --state-dir)
+      (($# >= 2)) || exit 64
+      state_dir=$2
+      shift 2
+      ;;
+    --help)
+      usage
+      exit 0
+      ;;
     *) exit 64 ;;
   esac
 done
 [[ -n "$state_dir" ]] || { usage >&2; exit 64; }
+
 fail=0
-check() { local name=$1 result=$2; if [[ "$result" == pass ]]; then printf '{"check":"%s","result":"pass"}\n' "$name"; else printf '{"check":"%s","result":"fail"}\n' "$name"; fail=1; fi; }
-[[ -c /dev/net/tun ]] && check tun pass || check tun fail
-[[ -c /dev/kvm ]] && check kvm pass || check kvm fail
-command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet platform.target && check platform_target pass || check platform_target fail
-for unit in mesh dns gateway compute; do systemctl is-active --quiet "$unit.service" && check "$unit" pass || check "$unit" fail; done
-command -v nft >/dev/null 2>&1 && nft -c -f /var/lib/gnx-node/ingress.nft >/dev/null 2>&1 && check ingress_rules pass || check ingress_rules fail
-getent hosts app.gnx >/dev/null 2>&1 && check dns_app pass || check dns_app fail
-getent hosts compute.gnx >/dev/null 2>&1 && check dns_compute pass || check dns_compute fail
-curl --fail --silent --show-error --connect-timeout 3 --max-time 5 --cacert /var/lib/gnx-node/ca/backend-ca.pem https://127.0.0.1:8006/ >/dev/null 2>&1 && check compute_https pass || check compute_https fail
-if ((fail)); then printf '{"ready":false}\n'; exit 1; fi
+check() {
+  local name=$1 result=$2
+  if [[ "$result" == pass ]]; then
+    printf '{"check":"%s","result":"pass"}\n' "$name"
+  else
+    printf '{"check":"%s","result":"fail"}\n' "$name"
+    fail=1
+  fi
+}
+
+[[ -d "$state_dir" ]] && check state_dir pass || check state_dir fail
+[[ -c /dev/net/tun && -r /dev/net/tun && -w /dev/net/tun ]] && check tun pass || check tun fail
+# KVM is deliberately independent from TUN: mesh can be healthy while compute
+# is blocked. KVM_GET_API_VERSION is a minimal real ioctl, not a mock probe.
+if [[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]] && command -v python3 >/dev/null 2>&1 && \
+   python3 -c 'import fcntl, os; fd = os.open("/dev/kvm", os.O_RDWR | os.O_CLOEXEC); version = fcntl.ioctl(fd, 0xAE00, 0); os.close(fd); raise SystemExit(0 if version >= 12 else 1)' >/dev/null 2>&1; then
+  check kvm pass
+else
+  check kvm fail
+fi
+
+if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet platform.target; then
+  check platform_target pass
+else
+  check platform_target fail
+fi
+for unit in mesh dns gateway compute; do
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$unit.service"; then
+    check "$unit" pass
+  else
+    check "$unit" fail
+  fi
+done
+if command -v podman >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 && \
+   podman exec gnx-mesh tailscale status --json 2>/dev/null |
+     python3 -c 'import json, sys; status = json.load(sys.stdin); self_info = status.get("Self") or {}; raise SystemExit(0 if status.get("BackendState") == "Running" and self_info.get("Online") is True and self_info.get("TailscaleIPs") else 1)' >/dev/null 2>&1; then
+  check mesh_authenticated pass
+else
+  check mesh_authenticated fail
+fi
+for unit in mesh dns gateway compute; do
+  image_ref=""
+  if [[ -r "/etc/containers/systemd/$unit.container" ]]; then
+    image_ref=$(sed -n 's/^Image=//p' "/etc/containers/systemd/$unit.container")
+  fi
+  if command -v podman >/dev/null 2>&1 && [[ "$image_ref" =~ @sha256:[0-9a-f]{64}$ ]] && podman image exists "$image_ref" >/dev/null 2>&1; then
+    check "image_$unit" pass
+  else
+    check "image_$unit" fail
+  fi
+done
+
+runtime_dir=/var/lib/gnx-node
+gateway_ca="$runtime_dir/ca/gateway-ca.pem"
+backend_ca="$runtime_dir/ca/backend-ca.pem"
+if command -v nft >/dev/null 2>&1 && nft -c -f "$runtime_dir/ingress.nft" >/dev/null 2>&1; then
+  check ingress_rules pass
+else
+  check ingress_rules fail
+fi
+if command -v getent >/dev/null 2>&1 && getent hosts app.gnx >/dev/null 2>&1; then
+  check dns_app pass
+else
+  check dns_app fail
+fi
+if command -v getent >/dev/null 2>&1 && getent hosts compute.gnx >/dev/null 2>&1; then
+  check dns_compute pass
+else
+  check dns_compute fail
+fi
+
+# Gateway CA validates both public node hostnames at :443. It is intentionally
+# distinct from backend-ca.pem, which is trusted only for internal compute :8006.
+if command -v curl >/dev/null 2>&1 && [[ -r "$gateway_ca" ]] && \
+   curl --fail --silent --show-error --connect-timeout 3 --max-time 5 \
+     --cacert "$gateway_ca" \
+     --resolve app.gnx:443:127.0.0.1 https://app.gnx/ >/dev/null 2>&1; then
+  check app_https pass
+else
+  check app_https fail
+fi
+if command -v curl >/dev/null 2>&1 && [[ -r "$gateway_ca" ]] && \
+   curl --fail --silent --show-error --connect-timeout 3 --max-time 5 \
+     --cacert "$gateway_ca" \
+     --resolve compute.gnx:443:127.0.0.1 https://compute.gnx/ >/dev/null 2>&1; then
+  check compute_gateway_https pass
+else
+  check compute_gateway_https fail
+fi
+
+# Resolve the canonical backend hostname to loopback so certificate hostname
+# validation remains enabled while testing Proxmox HTTPS on :8006.
+if command -v curl >/dev/null 2>&1 && [[ -r "$backend_ca" ]] && \
+   curl --fail --silent --show-error --connect-timeout 3 --max-time 5 \
+     --cacert "$backend_ca" \
+     --resolve compute.gnx:8006:127.0.0.1 https://compute.gnx:8006/ >/dev/null 2>&1; then
+  check compute_https pass
+else
+  check compute_https fail
+fi
+
+if ((fail)); then
+  printf '{"ready":false}\n'
+  exit 1
+fi
 printf '{"ready":true}\n'

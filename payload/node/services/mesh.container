@@ -7,13 +7,15 @@ Wants=network-online.target
 After=network-online.target
 Before=platform.target
 [Container]
-Image=docker.io/tailscale/tailscale@sha256:5e8c3d2a8acb2e4c6d6e76d6d9420c0b5d2f76f9a1d4e4f1f4bf05d0f4e2c0b1
+Image=docker.io/tailscale/tailscale@sha256:2667499ed87ae29218f292556ba062918402dd5e92e93637af14867e4df12dd3
 ContainerName=gnx-mesh
 Network=host
 AddDevice=/dev/net/tun
+AddCapability=NET_ADMIN
+AddCapability=NET_RAW
 Volume=/var/lib/gnx-node/mesh:/var/lib/tailscale:Z
 Environment=TS_STATE_DIR=/var/lib/tailscale
-EnvironmentFile=/etc/gnx/secrets/mesh.env
+EnvironmentFile=-/run/gnx-node/mesh.env
 [Service]
 Restart=always
 RestartSec=5s

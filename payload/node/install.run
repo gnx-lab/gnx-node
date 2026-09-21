@@ -1,51 +1,206 @@
 #!/usr/bin/env bash
 # Capacidad: runtime Linux de GnX Node
 # Implementación aprobada: Podman + Quadlets bajo systemd
-# Entrada: --payload-dir y --state-dir; los secretos solo llegan por ruta efímera
+# Entrada: --payload-dir, --state-dir y, opcionalmente, una ruta efímera de secreto
+# Los valores secretos nunca se aceptan como argumentos ni se escriben en la salida.
 set -Eeuo pipefail
 IFS=$'\n\t'
-usage() { printf '%s\n' 'usage: install.run check|install --payload-dir DIR --state-dir DIR'; }
-die() { printf '{"event":"error","code":"%s"}\n' "$1" >&2; exit 1; }
+umask 022
+
+usage() {
+  printf '%s\n' 'usage: install.run check|install --payload-dir DIR --state-dir DIR [--mesh-secret-file FILE]'
+}
+die() {
+  printf '{"event":"error","code":"%s"}\n' "$1" >&2
+  exit 1
+}
+emit() { printf '{"event":"%s"}\n' "$1"; }
+require_cmd() { command -v "$1" >/dev/null 2>&1 || die "MISSING_${1^^}"; }
+
 mode="${1:-}"
 [[ "$mode" == check || "$mode" == install ]] || { usage >&2; exit 64; }
 shift
-payload_dir=""; state_dir=""
+payload_dir=""
+state_dir=""
+mesh_secret_file=""
 while (($#)); do
   case "$1" in
-    --payload-dir) (($# >= 2)) || die INVALID_ARGUMENT; payload_dir=$2; shift 2 ;;
-    --state-dir) (($# >= 2)) || die INVALID_ARGUMENT; state_dir=$2; shift 2 ;;
-    --help) usage; exit 0 ;;
+    --payload-dir)
+      (($# >= 2)) || die INVALID_ARGUMENT
+      payload_dir=$2
+      shift 2
+      ;;
+    --state-dir)
+      (($# >= 2)) || die INVALID_ARGUMENT
+      state_dir=$2
+      shift 2
+      ;;
+    --mesh-secret-file)
+      (($# >= 2)) || die INVALID_ARGUMENT
+      mesh_secret_file=$2
+      shift 2
+      ;;
+    --help)
+      usage
+      exit 0
+      ;;
     *) die INVALID_ARGUMENT ;;
   esac
 done
-[[ -n "$payload_dir" && -n "$state_dir" ]] || die MISSING_PATH
-[[ -d "$payload_dir/services" && -f "$payload_dir/verify.run" ]] || die PAYLOAD_INVALID
-emit() { printf '{"event":"%s"}\n' "$1"; }
-require_cmd() { command -v "$1" >/dev/null 2>&1 || die "MISSING_${1^^}"; }
+
+[[ -n "$payload_dir" && -n "$state_dir" ]] || { usage >&2; exit 64; }
+[[ -d "$payload_dir/services" && -d "$payload_dir/gateway" && -d "$payload_dir/network" ]] || die PAYLOAD_INVALID
+for unit in mesh dns gateway compute; do
+  [[ -f "$payload_dir/services/$unit.container" ]] || die PAYLOAD_INVALID
+done
+[[ -f "$payload_dir/services/platform.target" && -f "$payload_dir/verify.run" ]] || die PAYLOAD_INVALID
+[[ -f "$payload_dir/gateway/routes.conf" && -f "$payload_dir/network/ingress.nft" ]] || die PAYLOAD_INVALID
+if [[ "$mode" == install ]]; then
+  [[ -d "$payload_dir/web-app" ]] || die WEB_APP_MISSING
+fi
+
+check_image_refs() {
+  local unit image_count image
+  for unit in mesh dns gateway compute; do
+    image_count=$(grep -Ec '^Image=' "$payload_dir/services/$unit.container")
+    [[ "$image_count" == 1 ]] || die "IMAGE_REFERENCE_$unit"
+    image=$(grep '^Image=' "$payload_dir/services/$unit.container" | cut -d= -f2-)
+    [[ "$image" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]] || die "IMAGE_NOT_DIGEST_$unit"
+  done
+  ! grep -R -E 'tls_insecure_skip_verify|Image=[^[:space:]@]+:[^@[:space:]]+$' "$payload_dir/services" "$payload_dir/gateway" >/dev/null 2>&1 || die INSECURE_PAYLOAD
+}
+
+check_secret_path() {
+  [[ -n "$mesh_secret_file" ]] || return 0
+  [[ -f "$mesh_secret_file" && -r "$mesh_secret_file" ]] || die MESH_SECRET_UNREADABLE
+  [[ "$(stat -c '%u' "$mesh_secret_file")" == 0 ]] || die MESH_SECRET_OWNER
+  local mode_bits
+  mode_bits=$(stat -c '%a' "$mesh_secret_file")
+  (( 10#$mode_bits <= 600 )) || die MESH_SECRET_PERMISSIONS
+  # The file is an EnvironmentFile, but its value is intentionally never read into
+  # the shell or echoed. The key can therefore not leak through argv or logs.
+  grep -Eq '^TS_AUTHKEY=[^[:space:]]+$' "$mesh_secret_file" || die MESH_SECRET_FORMAT
+}
+
+kvm_usable() {
+  [[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 -c 'import fcntl, os; fd = os.open("/dev/kvm", os.O_RDWR | os.O_CLOEXEC); version = fcntl.ioctl(fd, 0xAE00, 0); os.close(fd); raise SystemExit(0 if version >= 12 else 1)' >/dev/null 2>&1
+}
+
+mesh_authenticated() {
+  command -v podman >/dev/null 2>&1 || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  # Tailscale's JSON is consumed through stdin so neither status data nor a
+  # potentially identifying address can enter argv or the installer output.
+  podman exec gnx-mesh tailscale status --json 2>/dev/null |
+    python3 -c 'import json, sys; status = json.load(sys.stdin); self_info = status.get("Self") or {}; raise SystemExit(0 if status.get("BackendState") == "Running" and self_info.get("Online") is True and self_info.get("TailscaleIPs") else 1)' >/dev/null 2>&1
+}
+
 check_prereqs() {
   [[ "$(id -u)" == 0 ]] || die ROOT_REQUIRED
-  require_cmd systemctl; require_cmd install
+  require_cmd systemctl
+  require_cmd install
+  require_cmd grep
+  require_cmd stat
   [[ -d /run/systemd/system ]] || die SYSTEMD_REQUIRED
   [[ -c /dev/net/tun ]] || die TUN_UNAVAILABLE
-  [[ -c /dev/kvm ]] || die KVM_UNAVAILABLE
-  if ! command -v podman >/dev/null 2>&1 && [[ "$mode" == check ]]; then die PODMAN_MISSING; fi
+  [[ -r /dev/net/tun && -w /dev/net/tun ]] || die TUN_UNAVAILABLE
+  if [[ "$mode" == check ]]; then
+    kvm_usable || die KVM_UNAVAILABLE
+  else
+    [[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]] || die KVM_UNAVAILABLE
+  fi
+  if [[ "$mode" == check ]]; then
+    require_cmd nft
+    require_cmd curl
+    require_cmd getent
+    require_cmd python3
+  fi
+  if ! command -v podman >/dev/null 2>&1 && [[ "$mode" == check ]]; then
+    die PODMAN_MISSING
+  fi
+  check_image_refs
+  check_secret_path
 }
+
+install_dependencies() {
+  if command -v podman >/dev/null 2>&1 && command -v nft >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 && command -v getent >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update >/dev/null 2>&1 || die PODMAN_INSTALL_FAILED
+    DEBIAN_FRONTEND=noninteractive apt-get install -y podman nftables curl libc-bin python3 >/dev/null 2>&1 || die PODMAN_INSTALL_FAILED
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y podman nftables curl glibc-common python3 >/dev/null 2>&1 || die PODMAN_INSTALL_FAILED
+  else
+    die PODMAN_INSTALL_UNSUPPORTED
+  fi
+  require_cmd podman
+  require_cmd nft
+  require_cmd curl
+  require_cmd getent
+  require_cmd python3
+}
+
 check_prereqs
-if [[ "$mode" == check ]]; then emit check_ok; exit 0; fi
-if ! command -v podman >/dev/null 2>&1; then
-  if command -v apt-get >/dev/null 2>&1; then apt-get update >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get install -y podman >/dev/null
-  elif command -v dnf >/dev/null 2>&1; then dnf install -y podman >/dev/null
-  else die PODMAN_INSTALL_UNSUPPORTED; fi
+if [[ "$mode" == check ]]; then
+  emit check_ok
+  exit 0
 fi
-require_cmd podman
-unit_dir=/etc/containers/systemd; runtime_dir=/var/lib/gnx-node
-install -d -m 0755 "$unit_dir" "$runtime_dir" "$state_dir" "$runtime_dir/web-app" "$runtime_dir/ca"
-install -d -m 0700 /etc/gnx/secrets
-for unit in mesh dns gateway compute platform; do install -m 0644 "$payload_dir/services/$unit.$([[ "$unit" == platform ]] && echo target || echo container)" "$unit_dir/"; done
+install_dependencies
+kvm_usable || die KVM_UNAVAILABLE
+
+unit_dir=/etc/containers/systemd
+runtime_dir=/var/lib/gnx-node
+install -d -m 0755 "$unit_dir" "$runtime_dir" "$state_dir"
+chmod 0700 "$state_dir"
+install -d -m 0700 "$runtime_dir/mesh" "$runtime_dir/dns" "$runtime_dir/compute"
+install -d -m 0755 "$runtime_dir/ca"
+install -d -m 0755 "$runtime_dir/web-app"
+install -d -m 0700 /run/gnx-node
+
+# Materialise only immutable payload files. Re-running replaces the same units,
+# while state and externally managed CA remain intact.
+for unit in mesh dns gateway compute; do
+  install -m 0644 "$payload_dir/services/$unit.container" "$unit_dir/$unit.container"
+done
+install -m 0644 "$payload_dir/services/platform.target" "$unit_dir/platform.target"
 install -m 0644 "$payload_dir/gateway/routes.conf" "$runtime_dir/routes.conf"
 install -m 0644 "$payload_dir/network/ingress.nft" "$runtime_dir/ingress.nft"
-cp -a "$payload_dir/web-app/." "$runtime_dir/web-app/"; chmod -R a-w "$runtime_dir/web-app"
-chmod 0755 "$payload_dir/verify.run"
-if command -v nft >/dev/null 2>&1; then nft delete table inet gnx_ingress 2>/dev/null || true; nft -f "$runtime_dir/ingress.nft"; fi
-systemctl daemon-reload; systemctl enable --now platform.target >/dev/null
+install -m 0755 "$payload_dir/verify.run" "$runtime_dir/verify.run"
+
+# The application is a payload asset, not a mutable container volume.
+find "$runtime_dir/web-app" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+cp -a "$payload_dir/web-app/." "$runtime_dir/web-app/"
+chmod -R a-w "$runtime_dir/web-app"
+
+secret_staged=0
+if [[ -n "$mesh_secret_file" ]]; then
+  install -m 0600 "$mesh_secret_file" /run/gnx-node/mesh.env
+  secret_staged=1
+fi
+
+# Validate before replacing the live ruleset, then replace only this table.
+nft -c -f "$runtime_dir/ingress.nft" >/dev/null 2>&1 || die NFT_INVALID
+nft delete table inet gnx_ingress >/dev/null 2>&1 || true
+nft -f "$runtime_dir/ingress.nft" >/dev/null 2>&1 || die NFT_APPLY_FAILED
+
+systemctl daemon-reload
+systemctl enable --now platform.target >/dev/null 2>&1 || die PLATFORM_START_FAILED
+
+# A supplied enrollment key is usable only during the first mesh start. It is
+# staged in /run (tmpfs) and removed after systemd accepts mesh.service;
+# persistent mesh state is in the service volume, never the key.
+if ((secret_staged)); then
+  for _ in {1..60}; do
+    systemctl is-active --quiet mesh.service && mesh_authenticated && break
+    sleep 1
+  done
+  if ! systemctl is-active --quiet mesh.service; then
+    die MESH_START_FAILED
+  fi
+  mesh_authenticated || die MESH_AUTHENTICATION_FAILED
+  rm -f -- /run/gnx-node/mesh.env
+fi
 emit installed
