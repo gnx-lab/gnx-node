@@ -32,23 +32,22 @@ fn launch_local_ui(path: &std::path::Path) -> Result<(), Box<dyn std::error::Err
         http::{Request, Response},
         WebViewBuilder,
     };
-    let ui_path = std::fs::canonicalize(path)?;
-    let ui_url = format!("file:///{}", ui_path.to_string_lossy().replace('\\', "/"));
-    let allowed_url = ui_url.clone();
+    // WebView2 rejects file URLs in some installed/runtime contexts. Serve every
+    // local asset from our private protocol instead; no browser or HTTP listener.
+    let ui_root = std::fs::canonicalize(path)?
+        .parent()
+        .ok_or("Setup UI has no parent directory")?
+        .to_path_buf();
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
         .with_title("GnX Node Setup")
         .build(&event_loop)?;
     let webview = WebViewBuilder::new()
-        .with_custom_protocol("gnx".into(), |_, request: Request<Vec<u8>>| {
-            Response::builder()
-                .header("Content-Type", "application/json")
-                .header("Access-Control-Allow-Origin", "*")
-                .body(Cow::Owned(handle_bridge(request.body())))
-                .unwrap()
+        .with_custom_protocol("gnx".into(), move |_, request: Request<Vec<u8>>| {
+            handle_request(&ui_root, request)
         })
-        .with_navigation_handler(move |url| url == allowed_url || url.starts_with("gnx://"))
-        .with_url(&ui_url)
+        .with_navigation_handler(|url| url.starts_with("gnx://"))
+        .with_url("gnx://ui/index.html")
         .build(&window)?;
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -62,6 +61,41 @@ fn launch_local_ui(path: &std::path::Path) -> Result<(), Box<dyn std::error::Err
         let _ = &webview;
     });
     Ok(())
+}
+
+#[cfg(windows)]
+fn handle_request(
+    ui_root: &std::path::Path,
+    request: wry::http::Request<Vec<u8>>,
+) -> wry::http::Response<std::borrow::Cow<'static, [u8]>> {
+    use std::borrow::Cow;
+    let uri = request.uri();
+    let response = if uri.host() == Some("bridge") {
+        ("application/json", handle_bridge(request.body()))
+    } else if uri.host() == Some("ui") {
+        let relative = uri.path().trim_start_matches('/');
+        let allowed = matches!(relative, "index.html" | "styles.css" | "app.js");
+        let path = ui_root.join(relative);
+        if allowed && path.is_file() {
+            let mime = if relative.ends_with(".css") {
+                "text/css; charset=utf-8"
+            } else if relative.ends_with(".js") {
+                "text/javascript; charset=utf-8"
+            } else {
+                "text/html; charset=utf-8"
+            };
+            (mime, std::fs::read(path).unwrap_or_default())
+        } else {
+            ("text/plain; charset=utf-8", b"not found".to_vec())
+        }
+    } else {
+        ("text/plain; charset=utf-8", b"forbidden".to_vec())
+    };
+    wry::http::Response::builder()
+        .header("Content-Type", response.0)
+        .header("X-Content-Type-Options", "nosniff")
+        .body(Cow::Owned(response.1))
+        .unwrap()
 }
 
 #[cfg(windows)]
