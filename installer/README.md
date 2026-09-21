@@ -6,7 +6,12 @@ The MSI is the package boundary: it copies files and registers `GnXHostAgent`; i
 
 ```powershell
 ./installer/scripts/build.ps1
-dotnet build installer/bundle/Bundle.wixproj -p:Configuration=release
+./installer/scripts/verify.ps1
 ```
+
+The deterministic final artifacts are `build/installer/en-us/GnxNode.msi` and
+`build/installer/GnxNodeSetup.exe`; the verification script checks both files,
+their non-zero sizes, and SHA-256 hashes. To compile Burn independently after
+an MSI build, run `dotnet build installer/bundle/Bundle.wixproj -p:Configuration=release`.
 
 Setup uses the Windows WebView2 desktop control. The Evergreen WebView2 Runtime must be installed on the machine before launching `gnx-setup.exe`; Burn detects the runtime but does not download or bootstrap it. Install the runtime from Microsoft on offline/provisioned images, then launch Setup from the installed directory.

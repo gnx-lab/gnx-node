@@ -3,7 +3,9 @@
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <OutputType>Bundle</OutputType>
     <OutputName>GnxNodeSetup</OutputName>
-    <MsiPackage>$(MSBuildProjectDirectory)\..\..\build\installer\GnxNode.msi</MsiPackage>
+    <!-- WiX 5 localizes package output under the en-us folder. Keep this
+         absolute and deterministic so Burn always embeds the MSI just built. -->
+    <MsiPackage>$(MSBuildProjectDirectory)\..\..\build\installer\en-us\GnxNode.msi</MsiPackage>
     <DefineConstants>MsiPackage=$(MsiPackage)</DefineConstants>
   </PropertyGroup>
   <ItemGroup>

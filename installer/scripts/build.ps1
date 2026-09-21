@@ -3,7 +3,19 @@ $ErrorActionPreference = "Stop"
 $root = (Resolve-Path "$PSScriptRoot\..\..").Path
 $out = Join-Path $root "build\installer"
 New-Item -ItemType Directory -Force $out | Out-Null
-Push-Location $root; cargo build --workspace --release; if ($LASTEXITCODE) { throw "cargo build failed" }; Pop-Location
+$msi = Join-Path $out "en-us\GnxNode.msi"
+$exe = Join-Path $out "GnxNodeSetup.exe"
+foreach ($artifact in @($msi, $exe)) {
+    if (Test-Path -LiteralPath $artifact -PathType Leaf) {
+        Remove-Item -LiteralPath $artifact -Force
+    }
+}
+Push-Location $root
+try {
+    cargo build --workspace --release
+    if ($LASTEXITCODE) { throw "cargo build failed" }
+}
+finally { Pop-Location }
 $ui = Join-Path $out "ui"; New-Item -ItemType Directory -Force $ui | Out-Null
 Copy-Item (Join-Path $root "apps\setup\ui\*") $ui -Recurse -Force
 $node = Join-Path $out "..\payload\node"; New-Item -ItemType Directory -Force $node | Out-Null
@@ -16,4 +28,13 @@ $project = Join-Path $PSScriptRoot "..\GnxNode.wixproj"
 if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) { throw "WiX build unavailable: dotnet SDK not found" }
 dotnet build $project -p:Configuration=$Configuration -p:OutputPath=$out
 if ($LASTEXITCODE) { throw "WiX build failed" }
+if (!(Test-Path -LiteralPath $msi)) { throw "WiX did not produce the localized MSI: $msi" }
+
+# Burn is intentionally built after MSI so the bundle embeds this exact MSI.
+$bundle = Join-Path $PSScriptRoot "..\bundle\Bundle.wixproj"
+dotnet build $bundle -p:Configuration=$Configuration -p:OutputPath=$out
+if ($LASTEXITCODE) { throw "Burn build failed" }
+if (!(Test-Path -LiteralPath $exe)) { throw "Burn did not produce the setup bundle: $exe" }
 Write-Output "Installer build complete: $out"
+Write-Output "MSI: $msi"
+Write-Output "Burn: $exe"
