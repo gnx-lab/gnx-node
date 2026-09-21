@@ -1,4 +1,6 @@
 mod control_pipe;
+mod dedicated_account;
+mod linux_node;
 mod provisioning;
 mod state;
 
@@ -55,6 +57,15 @@ mod service {
         });
         let server = std::thread::spawn(|| control_pipe::run().map_err(|e| e.to_string()));
         let _ = stop_rx.recv();
+        let _ = status_handle.set_service_status(service::ServiceStatus {
+            service_type: service::ServiceType::OWN_PROCESS,
+            current_state: service::ServiceState::StopPending,
+            controls_accepted: service::ServiceControlAccept::empty(),
+            exit_code: service::ServiceExitCode::Win32(0),
+            checkpoint: 1,
+            wait_hint: std::time::Duration::from_secs(10),
+            process_id: None,
+        });
         control_pipe::request_stop();
         let _ = server.join();
         let _ = status_handle.set_service_status(service::ServiceStatus {

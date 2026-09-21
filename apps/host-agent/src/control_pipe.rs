@@ -1,16 +1,25 @@
 use crate::{provisioning, state};
 use gnx_control_protocol::{Request, Response, PROTOCOL_VERSION};
-use std::io::{self, BufRead, Write};
+use std::io;
+#[cfg(not(windows))]
+use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const PIPE_NAME: &str = r"\\.\pipe\GnX.Platform.Control";
+const PIPE_MAX_INSTANCES: u32 = 1;
+// Not exposed by every windows-sys release; this is the documented
+// PIPE_REJECT_REMOTE_CLIENTS dwPipeMode bit.
+const PIPE_REJECT_REMOTE_CLIENTS: u32 = 0x0000_0008;
 static STOP: AtomicBool = AtomicBool::new(false);
 
 #[cfg(windows)]
 pub fn request_stop() {
     STOP.store(true, Ordering::Release);
     // Wake a blocking ConnectNamedPipe so SCM stop cannot hang awaiting a client.
-    let _ = std::fs::OpenOptions::new().read(true).write(true).open(PIPE_NAME);
+    let _ = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(PIPE_NAME);
 }
 #[cfg(not(windows))]
 pub fn request_stop() {}
@@ -32,7 +41,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             if line.len() <= gnx_control_protocol::MAX_FRAME_BYTES {
                 if let Ok(req) = Request::from_frame(line.as_bytes()) {
-                    p = provisioning::handle(&req, &p);
+                    p = provisioning::execute(&req, &p);
                     state::save(&p)?;
                     let r = Response {
                         version: PROTOCOL_VERSION,
@@ -53,9 +62,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(windows)]
 fn run_windows() -> Result<(), Box<dyn std::error::Error>> {
     use std::mem::zeroed;
-    use std::ptr::{null, null_mut};
+    use std::ptr::null_mut;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_PIPE_CONNECTED, INVALID_HANDLE_VALUE,
+        CloseHandle, GetLastError, LocalFree, ERROR_PIPE_CONNECTED, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -64,7 +73,7 @@ fn run_windows() -> Result<(), Box<dyn std::error::Error>> {
     use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
-        PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+        PIPE_TYPE_BYTE, PIPE_WAIT,
     };
     STOP.store(false, Ordering::Release);
     let name: Vec<u16> = PIPE_NAME.encode_utf16().chain(std::iter::once(0)).collect();
@@ -75,6 +84,7 @@ fn run_windows() -> Result<(), Box<dyn std::error::Error>> {
     let mut descriptor = null_mut();
     let mut attrs: SECURITY_ATTRIBUTES = unsafe { zeroed() };
     attrs.nLength = std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32;
+    attrs.bInheritHandle = 0;
     attrs.lpSecurityDescriptor = unsafe {
         if ConvertStringSecurityDescriptorToSecurityDescriptorW(
             sddl.as_ptr(),
@@ -97,8 +107,8 @@ fn run_windows() -> Result<(), Box<dyn std::error::Error>> {
             CreateNamedPipeW(
                 name.as_ptr(),
                 PIPE_ACCESS_DUPLEX,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                PIPE_UNLIMITED_INSTANCES,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                PIPE_MAX_INSTANCES,
                 gnx_control_protocol::MAX_FRAME_BYTES as u32,
                 gnx_control_protocol::MAX_FRAME_BYTES as u32,
                 0,
@@ -117,6 +127,11 @@ fn run_windows() -> Result<(), Box<dyn std::error::Error>> {
             DisconnectNamedPipe(pipe);
             CloseHandle(pipe);
         }
+    }
+    unsafe {
+        // ConvertStringSecurityDescriptorToSecurityDescriptorW allocates this
+        // descriptor with LocalAlloc; release it after all pipe instances die.
+        LocalFree(descriptor as _);
     }
     Ok(())
 }
@@ -151,7 +166,7 @@ fn serve_client(
         while let Some(pos) = bytes.iter().position(|b| *b == b'\n') {
             let frame: Vec<u8> = bytes.drain(..=pos).collect();
             if let Ok(req) = Request::from_frame(&frame[..frame.len() - 1]) {
-                *current = provisioning::handle(&req, current);
+                *current = provisioning::execute(&req, current);
                 state::save(current)?;
                 let mut output = serde_json::to_vec(&Response {
                     version: PROTOCOL_VERSION,

@@ -386,3 +386,22 @@ Cada agente entrega un commit acotado a sus rutas, comandos reproducibles y evid
 - Proxmox VE Administration Guide: la interfaz web HTTPS usa el puerto `8006`.
 
 Estas referencias respaldan los contratos ya demostrados en el POC. La aceptación productiva debe reproducir esa evidencia en una instalación limpia antes de distribuir cada release.
+
+## 14. Estado de implementación y cobertura de esta entrega
+
+La primera integración ejecutable ya contiene el servicio SCM `GnXHostAgent`, el canal `\\.\pipe\GnX.Platform.Control` con DACL explícita para `SYSTEM`/`Administrators`, rechazo nativo de clientes remotos y una sola instancia concurrente, además del cliente Setup que espera el pipe y verifica que el proceso servidor sea `gnx-host-agent.exe`. El estado se persiste en `%ProgramData%\GnX\Node\state\` mediante snapshot y journal JSONL sanitizados; la clave `tskey-auth-*` se acepta únicamente en `JoinMesh`, nunca se serializa y se rechazan controles/espacios.
+
+El adaptador host valida la identidad fija `gnxnodesvc`, limita la distro a `gnx-node` y consume el contrato externo `install.run check|install`/`verify.run` sin copiar configuración Linux a Rust. El MSI copia el payload host, el runtime Linux y la PWA; `installer/bundle/Bundle.wixproj` construye Burn, detecta el runtime WebView2 por el registro y encadena el MSI. Setup sirve sus tres assets por el protocolo privado `gnx://`; no abre HTTP localhost ni permite navegación remota.
+
+Comandos reproducibles verificados en esta entrega:
+
+```text
+cargo fmt --all
+cargo test --workspace                         # 9 tests Rust: protocolo, sanitización, identidad y payload
+powershell -ExecutionPolicy Bypass -File installer/scripts/build.ps1
+powershell -ExecutionPolicy Bypass -File installer/scripts/verify.ps1
+dotnet build installer/bundle/Bundle.wixproj -p:Configuration=release
+node tests/node-runtime/test-runtime.mjs       # debe ejecutarse cuando el payload/node del agente runtime esté integrado
+```
+
+Pendientes de aceptación que requieren una VM Windows/WSL autorizada y no se pueden demostrar en este checkout: denegación efectiva de un usuario no administrador contra el pipe, continuidad después de reboot con `.wslconfig`, creación/ownership del perfil de `gnxnodesvc`, registro exclusivo de la distro sin adoptar distros ajenas, consumo y eliminación de la credencial efímera, instalación idempotente de Podman/Quadlets, `/dev/net/tun` y `/dev/kvm`, verificación HTTPS de `compute.gnx`, Split DNS/CA, reparación y desinstalación con confirmación de borrado de datos. El build Burn se verifica; la condición WebView2 y la transferencia automática a Setup deben probarse en una imagen limpia con Evergreen WebView2 instalado y ausente.

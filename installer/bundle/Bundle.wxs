@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Bundle Name="GnX Node" Manufacturer="GnX" Version="0.1.0.0"
+          UpgradeCode="DB8BFB10-FA20-4F4F-9B3E-35DBD15A2A1A"
+          Compressed="yes">
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication Theme="hyperlinkLicense"
+        LicenseUrl="" SuppressOptionsUI="yes" />
+    </BootstrapperApplication>
+    <util:RegistrySearch Id="WebView2Version" Variable="WebView2Version"
+      Root="HKLM"
+      Key="SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4A1E-9B5A-4C2B8F7E8C6D}"
+      Value="pv" Result="value" />
+    <bal:Condition Message="Microsoft Edge WebView2 Runtime is required before GnX Setup can start."
+      Condition="WixBundleInstalled OR (WebView2Version)" />
+    <Chain>
+      <MsiPackage SourceFile="$(var.MsiPackage)" DisplayName="GnX Node" />
+    </Chain>
+  </Bundle>
+</Wix>

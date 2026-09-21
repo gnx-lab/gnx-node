@@ -1,0 +1,14 @@
+<Project Sdk="WixToolset.Sdk/5.0.2">
+  <PropertyGroup>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <OutputType>Bundle</OutputType>
+    <OutputName>GnxNodeSetup</OutputName>
+    <MsiPackage>$(MSBuildProjectDirectory)\..\..\build\installer\GnxNode.msi</MsiPackage>
+    <DefineConstants>MsiPackage=$(MsiPackage)</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="WixToolset.Bal.wixext" Version="5.0.2" />
+    <PackageReference Include="WixToolset.Util.wixext" Version="5.0.2" />
+    <Compile Include="Bundle.wxs" />
+  </ItemGroup>
+</Project>

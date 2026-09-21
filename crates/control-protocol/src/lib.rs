@@ -85,8 +85,16 @@ impl Request {
                 "secret is only accepted by JoinMesh".into(),
             ));
         }
+        if self.operation == Operation::JoinMesh && self.tailscale_auth_key.is_none() {
+            return Err(ProtocolError::Invalid(
+                "mesh credential is required for JoinMesh".into(),
+            ));
+        }
         if let Some(key) = &self.tailscale_auth_key {
-            if !key.starts_with("tskey-auth-") || key.len() > 512 {
+            if !key.starts_with("tskey-auth-")
+                || key.len() > 512
+                || key.chars().any(|c| c.is_control() || c.is_whitespace())
+            {
                 return Err(ProtocolError::Invalid(
                     "invalid mesh credential format".into(),
                 ));
@@ -95,7 +103,7 @@ impl Request {
         Ok(())
     }
     pub fn from_frame(frame: &[u8]) -> Result<Self, ProtocolError> {
-        if frame.len() > MAX_FRAME_BYTES {
+        if frame.is_empty() || frame.len() > MAX_FRAME_BYTES {
             return Err(ProtocolError::FrameTooLarge);
         }
         let req: Self =
@@ -143,5 +151,21 @@ mod tests {
         assert!(!String::from_utf8(r.to_frame().unwrap())
             .unwrap()
             .contains("tskey"));
+    }
+
+    #[test]
+    fn rejects_secret_with_control_characters() {
+        let r = Request {
+            version: PROTOCOL_VERSION,
+            request_id: Uuid::new_v4(),
+            operation: Operation::JoinMesh,
+            tailscale_auth_key: Some("tskey-auth-a\n--bad".into()),
+        };
+        assert!(matches!(r.validate(), Err(ProtocolError::Invalid(_))));
+    }
+
+    #[test]
+    fn rejects_empty_frames() {
+        assert_eq!(Request::from_frame(b""), Err(ProtocolError::FrameTooLarge));
     }
 }

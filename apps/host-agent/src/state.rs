@@ -57,15 +57,46 @@ pub fn save(progress: &Progress) -> io::Result<()> {
 
 fn sanitize(progress: &Progress) -> Progress {
     let mut safe = progress.clone();
+    safe.phase = sanitize_text(&safe.phase);
     safe.message = sanitize_text(&safe.message);
     safe.error_code = safe.error_code.map(|value| sanitize_text(&value));
     safe
 }
 
 fn sanitize_text(value: &str) -> String {
-    let mut output = value.replace("tskey-auth-", "[redacted-key]-");
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_control() {
+            output.push(' ');
+            continue;
+        }
+        output.push(c);
+    }
+    let lower = output.to_ascii_lowercase();
+    if lower.contains("tskey-auth-") {
+        output = output
+            .split_whitespace()
+            .map(|part| {
+                if part.to_ascii_lowercase().contains("tskey-auth-") {
+                    "[redacted-key]"
+                } else {
+                    part
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
     for marker in ["password", "secret", "token"] {
-        output = output.replace(marker, "[redacted]");
+        let mut redacted = String::new();
+        let mut rest = output.as_str();
+        while let Some(index) = rest.to_ascii_lowercase().find(marker) {
+            redacted.push_str(&rest[..index]);
+            redacted.push_str("[redacted]");
+            rest = &rest[index + marker.len()..];
+        }
+        redacted.push_str(rest);
+        output = redacted;
     }
     output.chars().take(1024).collect()
 }
@@ -87,4 +118,24 @@ pub fn sanitized_path(path: &Path) -> String {
         .and_then(|n| n.to_str())
         .unwrap_or("payload")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_defaults_to_new() {
+        assert_eq!(initial().state, NodeState::New);
+    }
+
+    #[test]
+    fn persisted_text_is_sanitized() {
+        let mut p = initial();
+        p.message = "tskey-auth-secret password\nvalue".into();
+        let safe = sanitize(&p);
+        assert!(!safe.message.contains("tskey-auth-"));
+        assert!(!safe.message.contains("password"));
+        assert!(!safe.message.contains('\n'));
+    }
 }

@@ -22,16 +22,12 @@ fn locate_ui() -> std::path::PathBuf {
 
 #[cfg(windows)]
 fn launch_local_ui(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    use std::borrow::Cow;
     use tao::{
         event::{Event, WindowEvent},
         event_loop::{ControlFlow, EventLoop},
         window::WindowBuilder,
     };
-    use wry::{
-        http::{Request, Response},
-        WebViewBuilder,
-    };
+    use wry::{http::Request, WebViewBuilder};
     // WebView2 rejects file URLs in some installed/runtime contexts. Serve every
     // local asset from our private protocol instead; no browser or HTTP listener.
     let ui_root = std::fs::canonicalize(path)?
@@ -70,7 +66,7 @@ fn handle_request(
 ) -> wry::http::Response<std::borrow::Cow<'static, [u8]>> {
     use std::borrow::Cow;
     let uri = request.uri();
-    let response = if uri.host() == Some("bridge") {
+    let response = if uri.host() == Some("bridge") && request.method() == "POST" {
         ("application/json", handle_bridge(request.body()))
     } else if uri.host() == Some("ui") {
         let relative = uri.path().trim_start_matches('/');
