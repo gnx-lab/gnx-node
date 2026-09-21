@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Capacidad: readiness integral de GnX Node
+# Implementación aprobada: Quadlets funcionales y health HTTPS interno
+# Verifica TUN y KVM por separado; su salida JSONL es la única evidencia canónica
+set -Eeuo pipefail
+IFS=$'\n\t'
+usage() { printf '%s\n' 'usage: verify.run --state-dir DIR'; }
+state_dir=""
+while (($#)); do
+  case "$1" in
+    --state-dir) (($# >= 2)) || exit 64; state_dir=$2; shift 2 ;;
+    --help) usage; exit 0 ;;
+    *) exit 64 ;;
+  esac
+done
+[[ -n "$state_dir" ]] || { usage >&2; exit 64; }
+fail=0
+check() { local name=$1 result=$2; if [[ "$result" == pass ]]; then printf '{"check":"%s","result":"pass"}\n' "$name"; else printf '{"check":"%s","result":"fail"}\n' "$name"; fail=1; fi; }
+[[ -c /dev/net/tun ]] && check tun pass || check tun fail
+[[ -c /dev/kvm ]] && check kvm pass || check kvm fail
+command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet platform.target && check platform_target pass || check platform_target fail
+for unit in mesh dns gateway compute; do systemctl is-active --quiet "$unit.service" && check "$unit" pass || check "$unit" fail; done
+command -v nft >/dev/null 2>&1 && nft -c -f /var/lib/gnx-node/ingress.nft >/dev/null 2>&1 && check ingress_rules pass || check ingress_rules fail
+getent hosts app.gnx >/dev/null 2>&1 && check dns_app pass || check dns_app fail
+getent hosts compute.gnx >/dev/null 2>&1 && check dns_compute pass || check dns_compute fail
+curl --fail --silent --show-error --connect-timeout 3 --max-time 5 --cacert /var/lib/gnx-node/ca/backend-ca.pem https://127.0.0.1:8006/ >/dev/null 2>&1 && check compute_https pass || check compute_https fail
+if ((fail)); then printf '{"ready":false}\n'; exit 1; fi
+printf '{"ready":true}\n'

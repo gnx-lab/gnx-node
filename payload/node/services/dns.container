@@ -1,0 +1,18 @@
+# Capacidad: dns
+# Implementación aprobada para este release: Pi-hole
+# Entrada: DNS privado para *.gnx; exposición solo a tailscale0 y loopback
+[Unit]
+Description=GnX private DNS capability
+After=mesh.service
+Requires=mesh.service
+[Container]
+Image=docker.io/pihole/pihole@sha256:7fd7c1c7b0c2a8f5a8db35f7bdf0e4f8f3cf6b5e2d3a1c9e7f5d4b2a1c0e9f8d
+ContainerName=gnx-dns
+Network=host
+Environment=FTLCONF_dns_listeningMode=all
+Volume=/var/lib/gnx-node/dns:/etc/pihole:Z
+[Service]
+Restart=always
+RestartSec=5s
+[Install]
+WantedBy=platform.target

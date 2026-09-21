@@ -1,0 +1,21 @@
+# Capacidad: compute.gnx
+# Implementación aprobada para este release: imagen sellada Proxmox
+# Entrada interna: HTTPS 8006; requisitos: /dev/kvm y CA de backend
+# Exposición permitida: gateway.container mediante loopback únicamente
+[Unit]
+Description=GnX compute capability
+After=mesh.service
+Requires=mesh.service
+[Container]
+Image=registry.gnx.invalid/proxmox@sha256:9a6b4c2d1e0f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b
+ContainerName=gnx-compute
+Network=host
+AddDevice=/dev/kvm
+PublishPort=127.0.0.1:8006:8006
+Volume=/var/lib/gnx-node/compute:/var/lib/gnx-compute:Z
+Volume=/var/lib/gnx-node/ca:/etc/gnx/ca:ro,Z
+[Service]
+Restart=always
+RestartSec=10s
+[Install]
+WantedBy=platform.target

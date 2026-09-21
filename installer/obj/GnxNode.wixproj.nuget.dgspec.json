@@ -1,0 +1,44 @@
+{
+  "format": 1,
+  "restore": {
+    "C:\\Users\\mayas\\quetzalcoatl\\gnx-node\\installer\\GnxNode.wixproj": {}
+  },
+  "projects": {
+    "C:\\Users\\mayas\\quetzalcoatl\\gnx-node\\installer\\GnxNode.wixproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "C:\\Users\\mayas\\quetzalcoatl\\gnx-node\\installer\\GnxNode.wixproj",
+        "projectName": "GnxNode",
+        "projectPath": "C:\\Users\\mayas\\quetzalcoatl\\gnx-node\\installer\\GnxNode.wixproj",
+        "packagesPath": "C:\\Users\\mayas\\.nuget\\packages\\",
+        "outputPath": "C:\\Users\\mayas\\quetzalcoatl\\gnx-node\\installer\\obj\\",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "C:\\Users\\mayas\\AppData\\Roaming\\NuGet\\NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "native"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "native": {
+            "targetAlias": "native",
+            "projectReferences": {}
+          }
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        }
+      },
+      "frameworks": {
+        "native": {
+          "targetAlias": "native"
+        }
+      }
+    }
+  }
+}

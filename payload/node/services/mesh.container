@@ -1,0 +1,21 @@
+# Capacidad: mesh
+# Implementación aprobada para este release: Tailscale
+# Requisitos: /dev/net/tun y clave efímera consumida por el agente
+[Unit]
+Description=GnX private mesh capability
+Wants=network-online.target
+After=network-online.target
+Before=platform.target
+[Container]
+Image=docker.io/tailscale/tailscale@sha256:5e8c3d2a8acb2e4c6d6e76d6d9420c0b5d2f76f9a1d4e4f1f4bf05d0f4e2c0b1
+ContainerName=gnx-mesh
+Network=host
+AddDevice=/dev/net/tun
+Volume=/var/lib/gnx-node/mesh:/var/lib/tailscale:Z
+Environment=TS_STATE_DIR=/var/lib/tailscale
+EnvironmentFile=/etc/gnx/secrets/mesh.env
+[Service]
+Restart=always
+RestartSec=5s
+[Install]
+WantedBy=platform.target

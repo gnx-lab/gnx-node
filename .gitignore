@@ -1,0 +1,9 @@
+/build/
+/target/
+*.msi
+*.wixpdb
+*.wixobj
+*.log
+.env
+*.pem
+*.key

@@ -1,0 +1,19 @@
+# Capacidad: gateway
+# Implementación aprobada para este release: Caddy
+# Entrada: routes.conf; compute usa HTTPS con CA explícita, nunca TLS inseguro
+[Unit]
+Description=GnX HTTPS gateway capability
+After=mesh.service dns.service
+Requires=mesh.service dns.service
+[Container]
+Image=docker.io/library/caddy@sha256:3f7c1e4a2b9d6c8e0f1a3b5d7e9c2f4a6b8d0e1f3a5c7b9d2e4f6a8c0b1d3e5f
+ContainerName=gnx-gateway
+Network=host
+Volume=/var/lib/gnx-node/routes.conf:/etc/caddy/Caddyfile:ro,Z
+Volume=/var/lib/gnx-node/web-app:/srv/gnx-web:ro,Z
+Volume=/var/lib/gnx-node/ca:/etc/gnx/ca:ro,Z
+[Service]
+Restart=always
+RestartSec=5s
+[Install]
+WantedBy=platform.target

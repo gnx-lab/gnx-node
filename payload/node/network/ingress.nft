@@ -1,0 +1,14 @@
+#!/usr/sbin/nft -f
+# Capacidad: ingress del nodo
+# Implementación aprobada: nftables
+# Permite DNS y HTTPS solo por tailscale0/loopback; no expone 8006.
+table inet gnx_ingress {
+  chain input {
+    type filter hook input priority 0; policy drop;
+    iifname "lo" accept
+    iifname "tailscale0" udp dport 53 accept
+    iifname "tailscale0" tcp dport 53 accept
+    iifname "tailscale0" tcp dport 443 accept
+    ct state established,related accept
+  }
+}
