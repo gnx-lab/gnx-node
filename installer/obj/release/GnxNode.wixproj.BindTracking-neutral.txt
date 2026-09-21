@@ -1,7 +1,0 @@
-BuiltPdbOutput	C:\Users\mayas\quetzalcoatl\gnx-node\installer\obj\release\GnxNode.wixpdb
-BuiltTargetOutput	C:\Users\mayas\quetzalcoatl\gnx-node\installer\obj\release\GnxNode.msi
-Input	C:\Users\mayas\quetzalcoatl\gnx-node\installer\..\apps\setup\ui\index.html
-Input	C:\Users\mayas\quetzalcoatl\gnx-node\installer\..\payload\host\.wslconfig
-Input	C:\Users\mayas\quetzalcoatl\gnx-node\installer\..\target\release\gnx-host-agent.exe
-Input	C:\Users\mayas\quetzalcoatl\gnx-node\installer\..\target\release\gnx-setup.exe
-Intermediate	C:\Users\mayas\quetzalcoatl\gnx-node\installer\obj\release\#cab1.cab

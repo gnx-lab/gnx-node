@@ -1,6 +1,0 @@
-C:\Users\mayas\quetzalcoatl\gnx-node\build\installer\GnxNode.msi
-C:\Users\mayas\quetzalcoatl\gnx-node\build\installer\GnxNode.wixpdb
-C:\Users\mayas\quetzalcoatl\gnx-node\installer\obj\release\GnxNode.wixproj.CoreCompileInputs.cache
-C:\Users\mayas\quetzalcoatl\gnx-node\installer\obj\release\GnxNode.msi
-C:\Users\mayas\quetzalcoatl\gnx-node\installer\obj\release\GnxNode.wixpdb
-C:\Users\mayas\quetzalcoatl\gnx-node\installer\obj\release\GnxNode.wixproj.BindTracking-neutral.txt
