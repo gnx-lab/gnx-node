@@ -9,6 +9,8 @@ static STOP: AtomicBool = AtomicBool::new(false);
 #[cfg(windows)]
 pub fn request_stop() {
     STOP.store(true, Ordering::Release);
+    // Wake a blocking ConnectNamedPipe so SCM stop cannot hang awaiting a client.
+    let _ = std::fs::OpenOptions::new().read(true).write(true).open(PIPE_NAME);
 }
 #[cfg(not(windows))]
 pub fn request_stop() {}
