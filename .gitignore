@@ -9,3 +9,5 @@
 *.key
 /installer/obj/
 /installer/bin/
+/installer/bundle/bin/
+/installer/bundle/obj/
