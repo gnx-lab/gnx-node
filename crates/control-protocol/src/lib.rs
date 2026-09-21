@@ -165,6 +165,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_join_without_credential() {
+        let r = Request {
+            version: PROTOCOL_VERSION,
+            request_id: Uuid::new_v4(),
+            operation: Operation::JoinMesh,
+            tailscale_auth_key: None,
+        };
+        assert!(matches!(r.validate(), Err(ProtocolError::Invalid(_))));
+    }
+
+    #[test]
     fn rejects_empty_frames() {
         assert_eq!(Request::from_frame(b""), Err(ProtocolError::FrameTooLarge));
     }
