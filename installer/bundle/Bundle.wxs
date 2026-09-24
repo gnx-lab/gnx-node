@@ -2,19 +2,24 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal"
      xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
-  <Bundle Name="GnX Node" Manufacturer="GnX" Version="0.1.0.0"
+  <Bundle Name="GnX Node" Manufacturer="GnX" Version="0.1.1.0"
           UpgradeCode="DB8BFB10-FA20-4F4F-9B3E-35DBD15A2A1A"
           Compressed="yes">
     <BootstrapperApplication>
       <bal:WixStandardBootstrapperApplication Theme="hyperlinkLicense"
-        LicenseUrl="" SuppressOptionsUI="yes" />
+        LicenseUrl="" SuppressOptionsUI="yes"
+        LaunchTarget="[ProgramFilesFolder]GnX Node\gnx-setup.exe" />
     </BootstrapperApplication>
-    <util:RegistrySearch Id="WebView2Version" Variable="WebView2Version"
+    <util:RegistrySearch Id="WebView2VersionMachine" Variable="WebView2VersionMachine"
       Root="HKLM"
-      Key="SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4A1E-9B5A-4C2B8F7E8C6D}"
+      Key="SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+      Value="pv" Result="value" />
+    <util:RegistrySearch Id="WebView2VersionUser" Variable="WebView2VersionUser"
+      Root="HKCU"
+      Key="SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
       Value="pv" Result="value" />
     <bal:Condition Message="Microsoft Edge WebView2 Runtime is required before GnX Setup can start."
-      Condition="WixBundleInstalled OR (WebView2Version)" />
+      Condition="WixBundleInstalled OR (WebView2VersionMachine OR WebView2VersionUser)" />
     <Chain>
       <MsiPackage SourceFile="$(var.MsiPackage)" DisplayName="GnX Node" />
     </Chain>

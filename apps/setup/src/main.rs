@@ -42,7 +42,15 @@ fn launch_local_ui(path: &std::path::Path) -> Result<(), Box<dyn std::error::Err
         .with_custom_protocol("gnx".into(), move |_, request: Request<Vec<u8>>| {
             handle_request(&ui_root, request)
         })
-        .with_navigation_handler(|url| url.starts_with("gnx://"))
+        .with_navigation_handler(|url| {
+            // WebView2 maps custom protocols to an internal HTTP origin on
+            // Windows. Wry maps requests back before invoking our protocol
+            // handler, but navigation policy observes the internal form.
+            matches!(
+                url.as_str(),
+                "gnx://ui/index.html" | "http://gnx.ui/index.html" | "http://gnx.ui/index.html/"
+            )
+        })
         .with_url("gnx://ui/index.html")
         .build(&window)?;
     event_loop.run(move |event, _, control_flow| {
@@ -55,8 +63,7 @@ fn launch_local_ui(path: &std::path::Path) -> Result<(), Box<dyn std::error::Err
             *control_flow = ControlFlow::Exit;
         }
         let _ = &webview;
-    });
-    Ok(())
+    })
 }
 
 #[cfg(windows)]
@@ -66,7 +73,13 @@ fn handle_request(
 ) -> wry::http::Response<std::borrow::Cow<'static, [u8]>> {
     use std::borrow::Cow;
     let uri = request.uri();
-    let response = if uri.host() == Some("bridge") && request.method() == "POST" {
+    let response = if matches!(uri.scheme_str(), Some("gnx") | Some("http"))
+        && uri.host() == Some("ui")
+        && uri.path() == "/bridge"
+        && uri.query().is_none()
+        && request.method() == "POST"
+        && request.body().len() <= 8 * 1024
+    {
         ("application/json", handle_bridge(request.body()))
     } else if uri.host() == Some("ui") {
         let relative = uri.path().trim_start_matches('/');
@@ -96,13 +109,15 @@ fn handle_request(
 
 #[cfg(windows)]
 fn handle_bridge(body: &[u8]) -> Vec<u8> {
-    use gnx_control_protocol::{Operation, Request, PROTOCOL_VERSION};
+    use gnx_control_protocol::{Operation, Request};
     use serde::Deserialize;
     use uuid::Uuid;
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct BridgeRequest {
         method: String,
         tailscale_auth_key: Option<String>,
+        proxmox_password: Option<String>,
     }
     let result = (|| -> Result<Vec<u8>, String> {
         let bridge: BridgeRequest = serde_json::from_slice(body).map_err(|e| e.to_string())?;
@@ -112,18 +127,31 @@ fn handle_bridge(body: &[u8]) -> Vec<u8> {
             "JoinMesh" => Operation::JoinMesh,
             "Retry" => Operation::Retry,
             "Cancel" => Operation::Cancel,
-            "Deprovision" => Operation::Deprovision,
             _ => return Err("unsupported bridge method".into()),
         };
         if operation != Operation::JoinMesh && bridge.tailscale_auth_key.is_some() {
             return Err("credentials are accepted only by JoinMesh".into());
         }
-        let response = agent_client::request(&Request {
-            version: PROTOCOL_VERSION,
+        if !matches!(operation, Operation::Provision | Operation::JoinMesh)
+            && bridge.proxmox_password.is_some()
+        {
+            return Err("Proxmox credentials are accepted only by Provision or JoinMesh".into());
+        }
+        let request = Request {
+            version: agent_client::protocol_version(),
             request_id: Uuid::new_v4(),
             operation,
             tailscale_auth_key: bridge.tailscale_auth_key,
-        })
+            proxmox_password: bridge.proxmox_password,
+            secret_file: None,
+        };
+        let tailscale_auth_key = request.tailscale_auth_key.as_deref();
+        let proxmox_password = request.proxmox_password.as_deref();
+        let response = if tailscale_auth_key.is_some() || proxmox_password.is_some() {
+            agent_client::request_with_secrets(&request, tailscale_auth_key, proxmox_password)
+        } else {
+            agent_client::request(&request)
+        }
         .map_err(|e| e.to_string())?;
         serde_json::to_vec(&response).map_err(|e| e.to_string())
     })();

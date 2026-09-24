@@ -1,132 +1,64 @@
 #!/usr/bin/env bash
-# Capacidad: readiness integral de GnX Node
-# Implementación aprobada: Quadlets funcionales y health HTTPS interno
-# Verifica TUN y KVM por separado; su salida JSONL es la única evidencia canónica.
+# Capacidad: readiness integral de GnX Node; salida JSONL sanitizada.
 set -Eeuo pipefail
 IFS=$'\n\t'
-
 usage() { printf '%s\n' 'usage: verify.run --state-dir DIR'; }
 state_dir=""
 while (($#)); do
   case "$1" in
-    --state-dir)
-      (($# >= 2)) || exit 64
-      state_dir=$2
-      shift 2
-      ;;
-    --help)
-      usage
-      exit 0
-      ;;
+    --state-dir) (($# >= 2)) || exit 64; state_dir=$2; shift 2 ;;
+    --help) usage; exit 0 ;;
     *) exit 64 ;;
   esac
 done
 [[ -n "$state_dir" ]] || { usage >&2; exit 64; }
-
 fail=0
 check() {
   local name=$1 result=$2
-  if [[ "$result" == pass ]]; then
-    printf '{"check":"%s","result":"pass"}\n' "$name"
-  else
-    printf '{"check":"%s","result":"fail"}\n' "$name"
-    fail=1
-  fi
+  if [[ "$result" == pass ]]; then printf '{"check":"%s","result":"pass"}\n' "$name"; else printf '{"check":"%s","result":"fail"}\n' "$name"; fail=1; fi
 }
-
+valid_ipv4() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
 [[ -d "$state_dir" ]] && check state_dir pass || check state_dir fail
+if command -v podman >/dev/null 2>&1 && podman version --format '{{.Client.Version}}' 2>/dev/null | grep -Eq '^[6-9][0-9]*\.|^[1-9][0-9]{2,}\.'; then check podman_6 pass; else check podman_6 fail; fi
 [[ -c /dev/net/tun && -r /dev/net/tun && -w /dev/net/tun ]] && check tun pass || check tun fail
-# KVM is deliberately independent from TUN: mesh can be healthy while compute
-# is blocked. KVM_GET_API_VERSION is a minimal real ioctl, not a mock probe.
-if [[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]] && command -v python3 >/dev/null 2>&1 && \
-   python3 -c 'import fcntl, os; fd = os.open("/dev/kvm", os.O_RDWR | os.O_CLOEXEC); version = fcntl.ioctl(fd, 0xAE00, 0); os.close(fd); raise SystemExit(0 if version >= 12 else 1)' >/dev/null 2>&1; then
-  check kvm pass
-else
-  check kvm fail
-fi
-
-if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet platform.target; then
-  check platform_target pass
-else
-  check platform_target fail
-fi
+[[ -c /dev/fuse && -r /dev/fuse && -w /dev/fuse ]] && check fuse pass || check fuse fail
+# KVM is independent from TUN: mesh can be healthy while compute is blocked.
+if [[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]] && command -v python3 >/dev/null 2>&1 && python3 -c 'import fcntl, os; fd = os.open("/dev/kvm", os.O_RDWR | os.O_CLOEXEC); version = fcntl.ioctl(fd, 0xAE00, 0); os.close(fd); raise SystemExit(0 if version >= 12 else 1)' >/dev/null 2>&1; then check kvm pass; else check kvm fail; fi
+if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet platform.target; then check platform_target pass; else check platform_target fail; fi
 for unit in mesh dns gateway compute; do
-  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$unit.service"; then
-    check "$unit" pass
-  else
-    check "$unit" fail
-  fi
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$unit.service"; then check "$unit" pass; else check "$unit" fail; fi
 done
-if command -v podman >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 && \
-   podman exec gnx-mesh tailscale status --json 2>/dev/null |
-     python3 -c 'import json, sys; status = json.load(sys.stdin); self_info = status.get("Self") or {}; raise SystemExit(0 if status.get("BackendState") == "Running" and self_info.get("Online") is True and self_info.get("TailscaleIPs") else 1)' >/dev/null 2>&1; then
-  check mesh_authenticated pass
-else
-  check mesh_authenticated fail
-fi
+if command -v podman >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 && podman exec gnx-mesh tailscale status --json 2>/dev/null | python3 -c 'import json, sys; status = json.load(sys.stdin); self_info = status.get("Self") or {}; raise SystemExit(0 if status.get("BackendState") == "Running" and self_info.get("Online") is True and self_info.get("TailscaleIPs") else 1)' >/dev/null 2>&1; then check mesh_authenticated pass; else check mesh_authenticated fail; fi
 for unit in mesh dns gateway compute; do
   image_ref=""
-  if [[ -r "/etc/containers/systemd/$unit.container" ]]; then
-    image_ref=$(sed -n 's/^Image=//p' "/etc/containers/systemd/$unit.container")
-  fi
-  if command -v podman >/dev/null 2>&1 && [[ "$image_ref" =~ @sha256:[0-9a-f]{64}$ ]] && podman image exists "$image_ref" >/dev/null 2>&1; then
-    check "image_$unit" pass
-  else
-    check "image_$unit" fail
-  fi
+  if [[ -r "/etc/containers/systemd/$unit.container" ]]; then image_ref=$(sed -n 's/^Image=//p' "/etc/containers/systemd/$unit.container"); fi
+  if command -v podman >/dev/null 2>&1 && [[ "$image_ref" =~ @sha256:[0-9a-f]{64}$ ]] && podman image exists "$image_ref" >/dev/null 2>&1; then check "image_$unit" pass; else check "image_$unit" fail; fi
 done
-
 runtime_dir=/var/lib/gnx-node
 gateway_ca="$runtime_dir/ca/gateway-ca.pem"
 backend_ca="$runtime_dir/ca/backend-ca.pem"
-if command -v nft >/dev/null 2>&1 && nft -c -f "$runtime_dir/ingress.nft" >/dev/null 2>&1; then
-  check ingress_rules pass
-else
-  check ingress_rules fail
+if command -v nft >/dev/null 2>&1 && nft -c -f "$runtime_dir/ingress.nft" >/dev/null 2>&1; then check ingress_rules pass; else check ingress_rules fail; fi
+if command -v openssl >/dev/null 2>&1 && [[ -r "$gateway_ca" && -r "$runtime_dir/ca/gateway-cert.pem" ]] && openssl verify -CAfile "$gateway_ca" "$runtime_dir/ca/gateway-cert.pem" >/dev/null 2>&1; then check gateway_ca pass; else check gateway_ca fail; fi
+if command -v openssl >/dev/null 2>&1 && [[ -r "$backend_ca" && -r "$runtime_dir/ca/backend-cert.pem" ]] && openssl verify -CAfile "$backend_ca" "$runtime_dir/ca/backend-cert.pem" >/dev/null 2>&1; then check backend_ca pass; else check backend_ca fail; fi
+dns_ip=""
+if command -v podman >/dev/null 2>&1; then dns_ip=$(podman exec gnx-mesh tailscale ip -4 2>/dev/null | tr -d '\r' | awk 'NF { print $1; exit }' || true); fi
+if valid_ipv4 "$dns_ip" && command -v dig >/dev/null 2>&1 && [[ "$(dig +short +time=2 +tries=1 @"$dns_ip" app.gnx A 2>/dev/null | head -n1)" == "$dns_ip" ]]; then check dns_app pass; else check dns_app fail; fi
+if valid_ipv4 "$dns_ip" && command -v dig >/dev/null 2>&1 && [[ "$(dig +short +time=2 +tries=1 @"$dns_ip" compute.gnx A 2>/dev/null | head -n1)" == "$dns_ip" ]]; then check dns_compute pass; else check dns_compute fail; fi
+# Gateway CA validates public hostnames at :443; backend CA validates only
+# the internal Proxmox endpoint at :8006. No insecure TLS fallback is allowed.
+if command -v curl >/dev/null 2>&1 && [[ -r "$gateway_ca" ]] && curl --fail --silent --show-error --connect-timeout 3 --max-time 5 --cacert "$gateway_ca" --resolve app.gnx:443:127.0.0.1 https://app.gnx/ >/dev/null 2>&1; then check app_https pass; else check app_https fail; fi
+if command -v curl >/dev/null 2>&1 && [[ -r "$gateway_ca" ]] && curl --fail --silent --show-error --connect-timeout 3 --max-time 5 --cacert "$gateway_ca" --resolve compute.gnx:443:127.0.0.1 https://compute.gnx/ >/dev/null 2>&1; then check compute_gateway_https pass; else check compute_gateway_https fail; fi
+if command -v curl >/dev/null 2>&1 && [[ -r "$backend_ca" ]] && curl --fail --silent --show-error --connect-timeout 3 --max-time 5 --cacert "$backend_ca" --resolve compute.gnx:8006:127.0.0.1 https://compute.gnx:8006/ >/dev/null 2>&1; then check compute_https pass; else check compute_https fail; fi
+# Only sanitized addresses leave this process. JSON is parsed through stdin.
+tailscale_ip=""
+if command -v podman >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  tailscale_ip=$(podman exec gnx-mesh tailscale status --json 2>/dev/null | python3 -c 'import json,sys; s=json.load(sys.stdin); ips=(s.get("Self") or {}).get("TailscaleIPs") or []; print(next((x for x in ips if "." in x), ""))' 2>/dev/null || true)
 fi
-if command -v getent >/dev/null 2>&1 && getent hosts app.gnx >/dev/null 2>&1; then
-  check dns_app pass
-else
-  check dns_app fail
-fi
-if command -v getent >/dev/null 2>&1 && getent hosts compute.gnx >/dev/null 2>&1; then
-  check dns_compute pass
-else
-  check dns_compute fail
-fi
-
-# Gateway CA validates both public node hostnames at :443. It is intentionally
-# distinct from backend-ca.pem, which is trusted only for internal compute :8006.
-if command -v curl >/dev/null 2>&1 && [[ -r "$gateway_ca" ]] && \
-   curl --fail --silent --show-error --connect-timeout 3 --max-time 5 \
-     --cacert "$gateway_ca" \
-     --resolve app.gnx:443:127.0.0.1 https://app.gnx/ >/dev/null 2>&1; then
-  check app_https pass
-else
-  check app_https fail
-fi
-if command -v curl >/dev/null 2>&1 && [[ -r "$gateway_ca" ]] && \
-   curl --fail --silent --show-error --connect-timeout 3 --max-time 5 \
-     --cacert "$gateway_ca" \
-     --resolve compute.gnx:443:127.0.0.1 https://compute.gnx/ >/dev/null 2>&1; then
-  check compute_gateway_https pass
-else
-  check compute_gateway_https fail
-fi
-
-# Resolve the canonical backend hostname to loopback so certificate hostname
-# validation remains enabled while testing Proxmox HTTPS on :8006.
-if command -v curl >/dev/null 2>&1 && [[ -r "$backend_ca" ]] && \
-   curl --fail --silent --show-error --connect-timeout 3 --max-time 5 \
-     --cacert "$backend_ca" \
-     --resolve compute.gnx:8006:127.0.0.1 https://compute.gnx:8006/ >/dev/null 2>&1; then
-  check compute_https pass
-else
-  check compute_https fail
-fi
-
-if ((fail)); then
-  printf '{"ready":false}\n'
-  exit 1
-fi
+valid_ipv4 "$tailscale_ip" && check tailscale_ip pass || { tailscale_ip=""; check tailscale_ip fail; }
+pihole_ip="$dns_ip"
+valid_ipv4 "$pihole_ip" && check pihole_ip pass || { pihole_ip=""; check pihole_ip fail; }
+printf '{"network":{"tailscale_ip":"%s","pihole_ip":"%s"}}\n' "$tailscale_ip" "$pihole_ip"
+printf '%s\n' '{"next_actions":["Configure Split DNS for gnx to the reported Tailscale IP.","Trust the GnX gateway CA on authorized tailnet clients."]}'
+if ((fail)); then printf '{"ready":false}\n'; exit 1; fi
 printf '{"ready":true}\n'
+# End of the canonical readiness contract.

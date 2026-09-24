@@ -9,8 +9,15 @@ Requires=mesh.service
 Image=docker.io/pihole/pihole@sha256:5b9c8cf51de7d6d3f2240dbe72baf5f06e1fd39cb4d77a99fab4fa13e23bd1be
 ContainerName=gnx-dns
 Network=host
-Environment=FTLCONF_dns_listeningMode=all
+Environment=FTLCONF_dns_interface=tailscale0
+# WSL reserves loopback:53 for its DNS tunnel. FTL binds private DNS on an
+# internal port; nftables exposes only tailscale0:53 to authorized peers.
+Environment=FTLCONF_dns_port=5353
+Environment=FTLCONF_dns_listeningMode=BIND
+Environment=FTLCONF_webserver_port=8082
+Environment=FTLCONF_misc_etc_dnsmasq_d=true
 Volume=/var/lib/gnx-node/dns:/etc/pihole:Z
+Volume=/var/lib/gnx-node/dnsmasq.d:/etc/dnsmasq.d:Z
 [Service]
 Restart=always
 RestartSec=5s

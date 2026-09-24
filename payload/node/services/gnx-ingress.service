@@ -1,0 +1,13 @@
+# GnX private ingress policy; nftables state is volatile across WSL restarts.
+[Unit]
+Description=GnX Node private ingress firewall
+Before=platform.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-/usr/sbin/nft delete table inet gnx_ingress
+ExecStart=/usr/sbin/nft -f /var/lib/gnx-node/ingress.nft
+
+[Install]
+WantedBy=multi-user.target

@@ -15,9 +15,11 @@ AddCapability=NET_ADMIN
 AddCapability=NET_RAW
 Volume=/var/lib/gnx-node/mesh:/var/lib/tailscale:Z
 Environment=TS_STATE_DIR=/var/lib/tailscale
-EnvironmentFile=-/run/gnx-node/mesh.env
+Environment=TS_USERSPACE=false
+Environment=TS_ACCEPT_DNS=false
+EnvironmentFile=/run/gnx-node/mesh.env
 [Service]
 Restart=always
 RestartSec=5s
 [Install]
-WantedBy=platform.target
+WantedBy=multi-user.target

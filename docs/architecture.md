@@ -28,12 +28,14 @@ La implementación productiva debe reproducir esas condiciones, convertirlas en 
 
 El provisioning largo no vive dentro de la transacción MSI. WSL, descargas de imágenes, systemd y un posible reinicio requieren estado recuperable fuera de Windows Installer.
 
-| Capa | Tecnología | Responsabilidad |
-|---|---|---|
-| Bootstrapper | Burn | Elevación, prerequisitos y errores previos; encadena el MSI y lanza Setup. |
-| Servicio | Rust / LocalSystem | Ejecutar operaciones autorizadas, persistir estado reducido, crear cuenta/distro y reconciliar WSL. |
-| Setup | Rust + WebView2 | Progreso, errores, reintentos y entrada efímera de clave Tailscale. No ejecuta acciones privilegiadas directamente. |
-| Aplicación | PWA en `app.gnx` | Producto de usuario; no participa en instalación ni entrega secretos. |
+
+| Capa         | Tecnología         | Responsabilidad                                                                                                     |
+| ------------ | ------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| Bootstrapper | Burn               | Elevación, prerequisitos y errores previos; encadena el MSI y lanza Setup.                                          |
+| Servicio     | Rust / LocalSystem | Ejecutar operaciones autorizadas, persistir estado reducido, crear cuenta/distro y reconciliar WSL.                 |
+| Setup        | Rust + WebView2    | Progreso, errores, reintentos y entrada efímera de clave Tailscale. No ejecuta acciones privilegiadas directamente. |
+| Aplicación   | PWA en `app.gnx`   | Producto de usuario; no participa en instalación ni entrega secretos.                                               |
+
 
 **Límite único:** Burn/MSI termina al copiar/verificar archivos y registrar el servicio; Setup empieza el provisioning. No comparten pasos ni barras de progreso. Tras reiniciar, el servicio continúa desde su checkpoint y Setup vuelve a representar ese estado por el pipe.
 
@@ -50,7 +52,21 @@ Preparar WSL necesita reiniciar Windows.
 [Reiniciar ahora]  [Cerrar; continuaré automáticamente]
 ```
 
-Cada fase tiene `estado`, `título humano`, `detalle seguro`, `acción recomendada`, `operationId` y diagnóstico sanitizado. Un error nunca muestra una clave, contraseña, comando expandido o configuración secreta. Las únicas acciones son `GetProgress`, `Provision`, `JoinMesh`, `Retry`, `Cancel` y `Deprovision`; no existe ejecución arbitraria ni una segunda API de reparación.
+La implementacion nativa de Setup mantiene una allowlist exacta de los cinco
+metodos publicos y de los recursos `gnx://ui/{index.html,styles.css,app.js}` y
+`gnx://bridge`. El puente limita el cuerpo a 8 KiB y transmite unicamente una
+referencia a un archivo efimero; el agente comprueba version, tamano, replay,
+operacion y transicion antes de consumirlo. El archivo se elimina tras exito,
+fallo o timeout, y el arranque del servicio barre los nombres de staging
+conocidos para cubrir reinicio.
+
+El progreso puede incluir la IP privada del nodo y la de Pi-hole como campos
+separados, sin inferencia en la UI, ademas de acciones acotadas
+`CONFIGURE_SPLIT_DNS` (zona `gnx`) y `TRUST_PRIVATE_CA` (certificado publico).
+La clave privada de la CA de producto queda bajo ACL de `SYSTEM`/`Administrators`
+en `%ProgramData%\\GnX\\Node\\state\\ca`.
+
+Cada fase tiene `estado`, `título humano`, `detalle seguro`, `acción recomendada`, `operationId` y diagnóstico sanitizado. Un error nunca muestra una clave, contraseña, comando expandido o configuración secreta. Las únicas acciones son `GetProgress`, `Provision`, `JoinMesh`, `Retry` y `Cancel`; no existe ejecución arbitraria ni una segunda API de reparación.
 
 ## 3. Objetivos y límites
 
@@ -99,13 +115,15 @@ flowchart LR
   Edge -->|compute.gnx → HTTPS :8006| PVE
 ```
 
-| Componente | Privilegio | Hace | No hace |
-|---|---|---|---|
-| Setup | Administrador interactivo | Progreso, errores, consentimiento, clave efímera y solicitudes al pipe | Ejecutar WSL ni abrir puertos |
-| Host agent | LocalSystem | Cuenta, estado, WSL, rutina Linux y control de ciclo de vida | Exponer una API de red o aceptar cliente no autorizado |
-| `gnxnodesvc` | Sin login interactivo | Propietaria de la distro y de las operaciones WSL delegadas | Administrar Windows o acceder a secretos ajenos |
-| `gnx-node` | Root solo durante bootstrap/systemd | Podman, Quadlets y nftables | Cambiar Windows fuera del canal autorizado |
-| PWA `app.gnx` | Navegador | Aplicación de usuario | Leer pipe, secretos o administrar el nodo |
+
+| Componente    | Privilegio                          | Hace                                                                   | No hace                                                |
+| ------------- | ----------------------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------ |
+| Setup         | Administrador interactivo           | Progreso, errores, consentimiento, clave efímera y solicitudes al pipe | Ejecutar WSL ni abrir puertos                          |
+| Host agent    | LocalSystem                         | Cuenta, estado, WSL, rutina Linux y control de ciclo de vida           | Exponer una API de red o aceptar cliente no autorizado |
+| `gnxnodesvc`  | Sin login interactivo               | Propietaria de la distro y de las operaciones WSL delegadas            | Administrar Windows o acceder a secretos ajenos        |
+| `gnx-node`    | Root solo durante bootstrap/systemd | Podman, Quadlets y nftables                                            | Cambiar Windows fuera del canal autorizado             |
+| PWA `app.gnx` | Navegador                           | Aplicación de usuario                                                  | Leer pipe, secretos o administrar el nodo              |
+
 
 ## 5. Canal de control y secretos
 
@@ -113,7 +131,7 @@ El único canal de Setup al host agent es `\\.\pipe\GnX.Platform.Control`.
 
 - DACL explícita: `SYSTEM` y `Administrators`; sin `Everyone`, `Users` ni anónimo.
 - El agente valida token de Windows, rol administrador, versión de protocolo, tipo de mensaje, tamaño máximo y transición de estado permitida.
-- Mensajes versionados: `GetProgress`, `Provision`, `JoinMesh`, `Retry`, `Cancel`, `Deprovision`.
+- Mensajes versionados: `GetProgress`, `Provision`, `JoinMesh`, `Retry` y `Cancel`.
 - Respuestas: identificador de operación, porcentaje/fase, error clasificado y detalle sanitizado. Nunca devuelve secretos.
 - Un pipe no se publica mediante TCP, Caddy, WSL ni navegador.
 
@@ -150,7 +168,7 @@ Estados de intervención: `BLOCKED`, `FAILED`, `RECOVERY_REQUIRED`. `ACTION_REQU
 
 ## 7. WSL, KVM y runtime Linux
 
-El repositorio contiene `payload/host/.wslconfig` como archivo revisable, no como constante Rust. El agente crea el perfil de `gnxnodesvc`, valida ownership/hash/opciones y copia allí el archivo. El transporte probado por POC ejecuta WSL mediante una tarea efímera protegida bajo esa identidad, con credencial DPAPI accesible solo por SYSTEM/Administrators; cada tarea valida SID, argumentos permitidos, timeout, resultado y cleanup. La aplicación de cambios detiene primero `gnx-node`; cualquier apagado global de la VM WSL requiere consentimiento visible.
+El repositorio contiene `payload/host/.wslconfig` como archivo revisable, no como constante Rust. El agente crea el perfil de `gnxnodesvc`, valida la ruta exacta derivada del token, owner permitido, ACE de acceso, hash y opciones, y copia allí el archivo. El transporte probado por POC ejecuta WSL mediante una tarea efímera protegida bajo esa identidad, con credencial DPAPI accesible solo por SYSTEM/Administrators; cada tarea valida SID, argumentos permitidos, timeout, resultado y cleanup. La aplicación de cambios detiene primero `gnx-node`; cualquier apagado global de la VM WSL requiere consentimiento visible.
 
 ```ini
 # payload/host/.wslconfig
@@ -191,15 +209,17 @@ La imagen Proxmox validada por el POC es una dependencia cerrada del release y s
 
 **Regla:** el código implementa lógica; cada archivo expresa un contrato concreto del producto. No habrá `defaults.json`, schema genérico ni configuración “por si acaso”. Ningún secreto ni template ambiental vive dentro del binario Rust.
 
-| Contrato | Archivo fuente | Tratamiento |
-|---|---|---|
-| Recursos WSL y virtualización | `payload/host/.wslconfig` | Copiado al perfil dedicado tras validar hash y ownership |
-| Servicios e imágenes | `payload/node/services/*.container` | Una unidad por capacidad y una sola referencia `Image` por digest; no hay lock duplicado |
-| Enrutamiento `app.gnx`/`compute.gnx` | `payload/node/gateway/routes.conf` | Contrato fijo, revisable, sin secreto |
-| Exposición de red | `payload/node/network/ingress.nft` | Solo loopback y red privada |
-| Readiness del nodo | `payload/node/verify.run` | Única verificación integral consumida por agente y aceptación |
-| Secretos | Pipe + archivo efímero protegido cuando sea inevitable | Nunca Git, configuración legible, argumentos, URL o logs |
-| Estado/progreso | `%ProgramData%\GnX\Node\state\` | Única verdad persistida; fase, checkpoint, evidencia sanitizada y códigos de error |
+
+| Contrato                             | Archivo fuente                                         | Tratamiento                                                                              |
+| ------------------------------------ | ------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
+| Recursos WSL y virtualización        | `payload/host/.wslconfig`                              | Copiado al perfil dedicado tras validar ruta, owner permitido, ACE, hash y opciones      |
+| Servicios e imágenes                 | `payload/node/services/*.container`                    | Una unidad por capacidad y una sola referencia `Image` por digest; no hay lock duplicado |
+| Enrutamiento `app.gnx`/`compute.gnx` | `payload/node/gateway/routes.conf`                     | Contrato fijo, revisable, sin secreto                                                    |
+| Exposición de red                    | `payload/node/network/ingress.nft`                     | Solo loopback y red privada                                                              |
+| Readiness del nodo                   | `payload/node/verify.run`                              | Única verificación integral consumida por agente y aceptación                            |
+| Secretos                             | Pipe + archivo efímero protegido cuando sea inevitable | Nunca Git, configuración legible, argumentos, URL o logs                                 |
+| Estado/progreso                      | `%ProgramData%\GnX\Node\state\`                        | Única verdad persistida; fase, checkpoint, evidencia sanitizada y códigos de error       |
+
 
 ## 10. Árbol de proyecto — producto primero
 
@@ -331,7 +351,7 @@ Se trabaja en un proyecto nuevo con el árbol de esta propuesta; no se modifica 
 Entregables:
 
 1. Servicio Rust con ciclo de vida Windows, Named Pipe y autorización por token; rechazar clientes remotos mediante la opción nativa del pipe, limitar tamaño/concurrencia y verificar la identidad del servidor desde el cliente.
-2. Cuenta dedicada con ownership verificable, perfil real, permisos mínimos y ejecución WSL bajo esa identidad. Persistencia protegida de la credencial de cuenta cuando sea necesaria; sin contraseña en argumentos ni logs.
+2. Cuenta dedicada con ruta de perfil exacta, owner permitido y ACE de acceso verificables, perfil real, permisos mínimos y ejecución WSL bajo esa identidad. Persistencia protegida de la credencial de cuenta cuando sea necesaria; sin contraseña en argumentos ni logs.
 3. Registro exclusivo de `gnx-node`, aplicación de `.wslconfig`, preflight de virtualización, reinicios consentidos y recuperación idempotente. No tocar distros ajenas.
 4. Setup Rust + WebView2: pasos, progreso real, errores accionables, entrega efímera de clave, reconexión al servicio y continuación tras reboot. La UI usa solo assets locales confiables, bloquea navegación remota y expone un puente JS→Rust de operaciones permitidas, nunca ejecución arbitraria.
 5. Burn y MSI en proyectos separados: prerequisitos y errores visibles antes de disponer de WebView2; luego transferencia de UX a Setup. No mantener abierta una transacción MSI durante provisioning Linux.
@@ -358,16 +378,18 @@ Entregables:
 
 Ambos agentes acuerdan estos límites; el agente 1 registra la versión inicial en `crates/control-protocol` y el agente 2 la consume sin editar archivos del agente 1:
 
-| Frontera | Contrato mínimo |
-|---|---|
-| UI → agente | `GetProgress`, `Provision`, `JoinMesh`, `Retry`, `Cancel`, `Deprovision`; identificador de operación y versión. Sin comandos shell libres. |
-| Eventos de progreso | `operationId`, `sequence`, `phase`, `state`, `message`, `errorCode`, `retryable`, `requiresRestart`; porcentaje solo cuando es medible. |
-| Agente → runtime Linux | `install.run check|install` y `verify.run`; rutas de payload, estado y secreto temporal. Nunca el valor del secreto como argumento. |
-| Runtime → agente | Eventos JSON Lines sanitizados en stdout, diagnóstico sanitizado en stderr y exit code no cero en fallo. El agente persiste checkpoint y traduce el resultado a la UI. |
-| Assets PWA | Fuente `apps/web-app`; ensamblado copia a `build/payload/node/web-app`; gateway monta/lee ese directorio sin escritura. |
-| Imágenes | Cada `*.container` contiene una sola referencia por digest; build rechaza tags flotantes y genera el manifiesto/hashes del payload. |
-| Secretos | Agente 1 crea staging protegido; agente 2 consume por ruta y elimina copia Linux; agente 1 elimina staging en éxito/fallo/timeout. La credencial duradera de cuenta no se confunde con la clave efímera de alta. |
-| Resultado operativo | `NODE_READY` exige agente, distro, cuatro servicios, IP privada y verificaciones locales. Split DNS y CA del cliente se muestran aparte como `ACTION_REQUIRED` hasta confirmación; no alteran la verdad interna del nodo. |
+
+| Frontera               | Contrato mínimo                                                                                                                                                                                                           |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| UI → agente            | `GetProgress`, `Provision`, `JoinMesh`, `Retry`, `Cancel`; identificador de operación y versión. Sin comandos shell libres.                                                                                |
+| Eventos de progreso    | `operationId`, `sequence`, `phase`, `state`, `message`, `errorCode`, `retryable`, `requiresRestart`; porcentaje solo cuando es medible.                                                                                   |
+| Agente → runtime Linux | `install.run check|install` y `verify.run`; rutas de payload, estado y secreto temporal. Nunca el valor del secreto como argumento.                                                                                       |
+| Runtime → agente       | Eventos JSON Lines sanitizados en stdout, diagnóstico sanitizado en stderr y exit code no cero en fallo. El agente persiste checkpoint y traduce el resultado a la UI.                                                    |
+| Assets PWA             | Fuente `apps/web-app`; ensamblado copia a `build/payload/node/web-app`; gateway monta/lee ese directorio sin escritura.                                                                                                   |
+| Imágenes               | Cada `*.container` contiene una sola referencia por digest; build rechaza tags flotantes y genera el manifiesto/hashes del payload.                                                                                       |
+| Secretos               | Agente 1 crea staging protegido; agente 2 consume por ruta y elimina copia Linux; agente 1 elimina staging en éxito/fallo/timeout. La credencial duradera de cuenta no se confunde con la clave efímera de alta.          |
+| Resultado operativo    | `NODE_READY` exige agente, distro, cuatro servicios, IP privada y verificaciones locales. Split DNS y CA del cliente se muestran aparte como `ACTION_REQUIRED` hasta confirmación; no alteran la verdad interna del nodo. |
+
 
 Un reintento reutiliza operación/checkpoint sin duplicar cuenta o distro. Cancelar solo detiene en un límite seguro y no borra recursos parcialmente instalados. Desconectar/cerrar la UI no cancela el trabajo del servicio. Tras reinicio, la UI obtiene snapshot y eventos posteriores sin inventar progreso.
 
@@ -404,4 +426,8 @@ dotnet build installer/bundle/Bundle.wixproj -p:Configuration=release
 node tests/node-runtime/test-runtime.mjs       # debe ejecutarse cuando el payload/node del agente runtime esté integrado
 ```
 
-Pendientes de aceptación que requieren una VM Windows/WSL autorizada y no se pueden demostrar en este checkout: denegación efectiva de un usuario no administrador contra el pipe, continuidad después de reboot con `.wslconfig`, creación/ownership del perfil de `gnxnodesvc`, registro exclusivo de la distro sin adoptar distros ajenas, consumo y eliminación de la credencial efímera, instalación idempotente de Podman/Quadlets, `/dev/net/tun` y `/dev/kvm`, verificación HTTPS de `compute.gnx`, Split DNS/CA, reparación y desinstalación con confirmación de borrado de datos. El build Burn se verifica; la condición WebView2 y la transferencia automática a Setup deben probarse en una imagen limpia con Evergreen WebView2 instalado y ausente.
+Pendientes de aceptación que requieren una VM Windows/WSL autorizada y no se pueden demostrar en este checkout: denegación efectiva de un usuario no administrador contra el pipe, continuidad después de reboot con `.wslconfig`, creación del perfil de `gnxnodesvc` y validación de ruta/owner permitido/ACE, registro exclusivo de la distro sin adoptar distros ajenas, consumo y eliminación de la credencial efímera, instalación idempotente de Podman/Quadlets, `/dev/net/tun` y `/dev/kvm`, verificación HTTPS de `compute.gnx`, Split DNS/CA, reparación y desinstalación con confirmación de borrado de datos. El build Burn se verifica; la condición WebView2 y la transferencia automática a Setup deben probarse en una imagen limpia con Evergreen WebView2 instalado y ausente.
+
+### sessions
+
+ pi --session 01a0cb55-85b0-7652-9c62-667c7fe04b25

@@ -1,7 +1,9 @@
+mod ca;
 mod control_pipe;
 mod dedicated_account;
 mod linux_node;
 mod provisioning;
+mod secret_store;
 mod state;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -12,7 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if std::env::var_os("GNX_CONSOLE").is_some() {
             return control_pipe::run();
         }
-        return service::run().map_err(|e| e.into());
+        service::run().map_err(|e| e.into())
     }
     #[cfg(not(windows))]
     control_pipe::run()
@@ -22,7 +24,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod service {
     use super::control_pipe;
     use std::ffi::OsString;
-    use std::sync::mpsc;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    };
     use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
     use windows_service::{define_windows_service, service, service_dispatcher, Result};
 
@@ -56,7 +61,42 @@ mod service {
             process_id: None,
         });
         let server = std::thread::spawn(|| control_pipe::run().map_err(|e| e.to_string()));
+        // WSL intentionally shuts a distro down when its last Windows-side
+        // client exits, even while systemd units are active. Keep one harmless
+        // client attached so the private DNS and HTTPS endpoints stay online.
+        let stop_keepalive = Arc::new(AtomicBool::new(false));
+        let keepalive_flag = Arc::clone(&stop_keepalive);
+        let keepalive = std::thread::spawn(move || {
+            let args = vec![
+                "--distribution".into(),
+                crate::linux_node::DISTRO_NAME.into(),
+                "--".into(),
+                "/bin/sleep".into(),
+                "5".into(),
+            ];
+            while !keepalive_flag.load(Ordering::Relaxed) {
+                if crate::dedicated_account::run_wsl_as_windows_identity(&args).is_err() {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+            }
+        });
+        // Reuse the canonical verifier instead of inventing browser-side
+        // health checks. This is a thread of the existing host service, not a
+        // new network service or a browser control channel.
+        let status_flag = Arc::clone(&stop_keepalive);
+        let status_monitor = std::thread::spawn(move || {
+            while !status_flag.load(Ordering::Relaxed) {
+                let _ = crate::state::refresh_app_status();
+                for _ in 0..15 {
+                    if status_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            }
+        });
         let _ = stop_rx.recv();
+        stop_keepalive.store(true, Ordering::Relaxed);
         let _ = status_handle.set_service_status(service::ServiceStatus {
             service_type: service::ServiceType::OWN_PROCESS,
             current_state: service::ServiceState::StopPending,
@@ -68,6 +108,8 @@ mod service {
         });
         control_pipe::request_stop();
         let _ = server.join();
+        let _ = keepalive.join();
+        let _ = status_monitor.join();
         let _ = status_handle.set_service_status(service::ServiceStatus {
             service_type: service::ServiceType::OWN_PROCESS,
             current_state: service::ServiceState::Stopped,

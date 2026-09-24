@@ -1,21 +1,23 @@
 #!/usr/bin/env bash
 # Capacidad: runtime Linux de GnX Node
 # Implementación aprobada: Podman + Quadlets bajo systemd
-# Entrada: --payload-dir, --state-dir y, opcionalmente, una ruta efímera de secreto
-# Los valores secretos nunca se aceptan como argumentos ni se escriben en la salida.
+# Entradas: rutas a archivos protegidos; nunca valores secretos en argv.
 set -Eeuo pipefail
 IFS=$'\n\t'
-umask 022
+umask 077
 
-usage() {
-  printf '%s\n' 'usage: install.run check|install --payload-dir DIR --state-dir DIR [--mesh-secret-file FILE]'
-}
-die() {
-  printf '{"event":"error","code":"%s"}\n' "$1" >&2
-  exit 1
-}
+usage() { printf '%s\n' 'usage: install.run check|install --payload-dir DIR --state-dir DIR [--mesh-secret-file FILE] [--compute-secret-file FILE]'; }
+die() { printf '{"event":"error","code":"%s"}\n' "$1" >&2; exit 1; }
 emit() { printf '{"event":"%s"}\n' "$1"; }
 require_cmd() { command -v "$1" >/dev/null 2>&1 || die "MISSING_${1^^}"; }
+podman_6_or_newer() {
+  local version major
+  version=$(podman version --format '{{.Client.Version}}' 2>/dev/null || true)
+  [[ "$version" =~ ^([0-9]+)\. ]] || return 1
+  major=${BASH_REMATCH[1]}
+  ((10#$major >= 6))
+}
+require_podman_6() { podman_6_or_newer || die PODMAN_6_REQUIRED; }
 
 mode="${1:-}"
 [[ "$mode" == check || "$mode" == install ]] || { usage >&2; exit 64; }
@@ -23,46 +25,40 @@ shift
 payload_dir=""
 state_dir=""
 mesh_secret_file=""
+compute_secret_file=""
 while (($#)); do
   case "$1" in
-    --payload-dir)
-      (($# >= 2)) || die INVALID_ARGUMENT
-      payload_dir=$2
-      shift 2
-      ;;
-    --state-dir)
-      (($# >= 2)) || die INVALID_ARGUMENT
-      state_dir=$2
-      shift 2
-      ;;
-    --mesh-secret-file)
-      (($# >= 2)) || die INVALID_ARGUMENT
-      mesh_secret_file=$2
-      shift 2
-      ;;
-    --help)
-      usage
-      exit 0
-      ;;
+    --payload-dir) (($# >= 2)) || die INVALID_ARGUMENT; payload_dir=$2; shift 2 ;;
+    --state-dir) (($# >= 2)) || die INVALID_ARGUMENT; state_dir=$2; shift 2 ;;
+    --mesh-secret-file) (($# >= 2)) || die INVALID_ARGUMENT; mesh_secret_file=$2; shift 2 ;;
+    --compute-secret-file) (($# >= 2)) || die INVALID_ARGUMENT; compute_secret_file=$2; shift 2 ;;
+    --help) usage; exit 0 ;;
     *) die INVALID_ARGUMENT ;;
   esac
 done
-
 [[ -n "$payload_dir" && -n "$state_dir" ]] || { usage >&2; exit 64; }
 [[ -d "$payload_dir/services" && -d "$payload_dir/gateway" && -d "$payload_dir/network" ]] || die PAYLOAD_INVALID
-for unit in mesh dns gateway compute; do
-  [[ -f "$payload_dir/services/$unit.container" ]] || die PAYLOAD_INVALID
-done
-[[ -f "$payload_dir/services/platform.target" && -f "$payload_dir/verify.run" ]] || die PAYLOAD_INVALID
+for unit in mesh dns gateway compute; do [[ -f "$payload_dir/services/$unit.container" ]] || die PAYLOAD_INVALID; done
+[[ -f "$payload_dir/services/platform.target" && -f "$payload_dir/services/gnx-ingress.service" && -f "$payload_dir/verify.run" ]] || die PAYLOAD_INVALID
 [[ -f "$payload_dir/gateway/routes.conf" && -f "$payload_dir/network/ingress.nft" ]] || die PAYLOAD_INVALID
-if [[ "$mode" == install ]]; then
-  [[ -d "$payload_dir/web-app" ]] || die WEB_APP_MISSING
-fi
+[[ -f "$payload_dir/compute/install-tls.sh" ]] || die PAYLOAD_INVALID
+[[ -d "$payload_dir/web-app" ]] || die WEB_APP_MISSING
+
+runtime_dir=/var/lib/gnx-node
+ca_dir="$runtime_dir/ca"
+private_ca_dir="$runtime_dir/ca-private"
+secret_dir="$runtime_dir/secrets"
+compute_config_dir="$runtime_dir/compute-config"
+compute_systemd_dir="$runtime_dir/compute-systemd"
+compute_hook_dir="$runtime_dir/compute-hook"
+dnsmasq_dir="$runtime_dir/dnsmasq.d"
+compute_hostname_file="$compute_config_dir/hostname"
+mesh_staged=0
 
 check_image_refs() {
   local unit image_count image
   for unit in mesh dns gateway compute; do
-    image_count=$(grep -Ec '^Image=' "$payload_dir/services/$unit.container")
+    image_count=$(grep -Ec '^Image=' "$payload_dir/services/$unit.container" || true)
     [[ "$image_count" == 1 ]] || die "IMAGE_REFERENCE_$unit"
     image=$(grep '^Image=' "$payload_dir/services/$unit.container" | cut -d= -f2-)
     [[ "$image" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]] || die "IMAGE_NOT_DIGEST_$unit"
@@ -70,16 +66,118 @@ check_image_refs() {
   ! grep -R -E 'tls_insecure_skip_verify|Image=[^[:space:]@]+:[^@[:space:]]+$' "$payload_dir/services" "$payload_dir/gateway" >/dev/null 2>&1 || die INSECURE_PAYLOAD
 }
 
-check_secret_path() {
-  [[ -n "$mesh_secret_file" ]] || return 0
-  [[ -f "$mesh_secret_file" && -r "$mesh_secret_file" ]] || die MESH_SECRET_UNREADABLE
-  [[ "$(stat -c '%u' "$mesh_secret_file")" == 0 ]] || die MESH_SECRET_OWNER
-  local mode_bits
-  mode_bits=$(stat -c '%a' "$mesh_secret_file")
-  (( 10#$mode_bits <= 600 )) || die MESH_SECRET_PERMISSIONS
-  # The file is an EnvironmentFile, but its value is intentionally never read into
-  # the shell or echoed. The key can therefore not leak through argv or logs.
-  grep -Eq '^TS_AUTHKEY=[^[:space:]]+$' "$mesh_secret_file" || die MESH_SECRET_FORMAT
+check_secret_file() {
+  local path=$1 variable=$2 mode_bits host_staging=0
+  [[ -f "$path" && ! -L "$path" && -r "$path" ]] || die "${variable}_SECRET_UNREADABLE"
+  # The Windows host stages ACL-protected files below the same state-dir. When
+  # accessed from WSL, drvfs may report synthetic owner/mode bits, so the
+  # service-owned staging directory is accepted only with a fixed filename
+  # contract; direct operator paths still require Unix root ownership/mode.
+  case "$path" in
+    "$state_dir"/staging/mesh-*.env|"$state_dir"/staging/compute-*.env) host_staging=1 ;;
+  esac
+  if (( !host_staging )); then [[ "$(stat -c '%u' "$path")" == 0 ]] || die "${variable}_SECRET_OWNER"; fi
+  mode_bits=$(stat -c '%a' "$path")
+  if (( !host_staging )); then [[ "$mode_bits" == 400 || "$mode_bits" == 600 ]] || die "${variable}_SECRET_PERMISSIONS"; fi
+  [[ "$(awk 'END { print NR }' "$path")" == 1 ]] || die "${variable}_SECRET_FORMAT"
+  if [[ "$variable" == TS_AUTHKEY ]]; then
+    grep -Eq '^TS_AUTHKEY=[^[:space:]]+$' "$path" || die "${variable}_SECRET_FORMAT"
+    [[ "$(grep -c '^TS_AUTHKEY=' "$path")" == 1 ]] || die "${variable}_SECRET_FORMAT"
+  else
+    # Host validation permits spaces in a Proxmox password; the staged file
+    # has already rejected control characters and contains one EnvironmentFile
+    # assignment, so retain the full value without reading it into argv.
+    grep -Eq '^PROXMOX_PASSWORD=.+$' "$path" || die "${variable}_SECRET_FORMAT"
+    [[ "$(grep -c '^PROXMOX_PASSWORD=' "$path")" == 1 ]] || die "${variable}_SECRET_FORMAT"
+  fi
+}
+check_secret_path() { check_secret_file "$@"; }
+
+check_runtime_password_file() {
+  local path=$1 value
+  [[ -f "$path" && ! -L "$path" && -r "$path" ]] || die PROXMOX_RUNTIME_SECRET_UNREADABLE
+  [[ "$(stat -c '%a' "$path")" == 600 ]] || die PROXMOX_RUNTIME_SECRET_PERMISSIONS
+  [[ "$(awk 'END { print NR }' "$path")" == 1 ]] || die PROXMOX_RUNTIME_SECRET_FORMAT
+  value=$(sed -n 's/^PASSWORD=//p' "$path")
+  [[ -n "$value" && "$value" != *$'\r'* && "$value" != *$'\t'* ]] || die PROXMOX_RUNTIME_SECRET_FORMAT
+  [[ "$(grep -c '^PASSWORD=' "$path")" == 1 ]] || die PROXMOX_RUNTIME_SECRET_FORMAT
+  unset value
+}
+
+write_compute_secret() {
+  local input=$1 value
+  check_secret_file "$input" PROXMOX_PASSWORD
+  [[ "$(awk 'END { print NR }' "$input")" == 1 ]] || die PROXMOX_SECRET_FORMAT
+  value=$(sed -n 's/^PROXMOX_PASSWORD=//p' "$input")
+  [[ -n "$value" && "$value" != *$'\r'* && "$value" != *$'\t'* ]] || die PROXMOX_SECRET_FORMAT
+  [[ "$(grep -c '^PROXMOX_PASSWORD=' "$input")" == 1 ]] || die PROXMOX_SECRET_FORMAT
+  printf 'PASSWORD=%s\n' "$value" > "$secret_dir/compute.env.new"
+  unset value
+  chmod 0600 "$secret_dir/compute.env.new"
+  mv -f -- "$secret_dir/compute.env.new" "$secret_dir/compute.env"
+}
+
+write_private_dns() {
+  local ip=$1
+  local octet
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die MESH_IP_INVALID
+  IFS=. read -r -a octets <<< "$ip"
+  for octet in "${octets[@]}"; do (( octet <= 255 )) || die MESH_IP_INVALID; done
+  install -d -m 0755 "$dnsmasq_dir"
+  # Pi-hole's BIND mode uses FTLCONF_dns_interface=tailscale0 and adds
+  # loopback itself. Keep this file to records only; duplicate interface or
+  # listen-address directives make FTL also bind WSL's reserved DNS tunnel.
+  printf 'address=/app.gnx/%s\naddress=/compute.gnx/%s\n' "$ip" "$ip" > "$dnsmasq_dir/02-gnx.conf"
+  chmod 0644 "$dnsmasq_dir/02-gnx.conf"
+}
+
+wait_for_mesh_auth() {
+  for _ in {1..60}; do
+    mesh_authenticated && return 0
+    sleep 1
+  done
+  return 1
+}
+
+runtime_https_ready() {
+  [[ -r "$ca_dir/gateway-ca.pem" && -r "$ca_dir/backend-ca.pem" ]] || return 1
+  curl --fail --silent --connect-timeout 1 --max-time 2 --cacert "$ca_dir/gateway-ca.pem" --resolve app.gnx:443:127.0.0.1 https://app.gnx/ >/dev/null 2>&1 || return 1
+  curl --fail --silent --connect-timeout 1 --max-time 2 --cacert "$ca_dir/gateway-ca.pem" --resolve compute.gnx:443:127.0.0.1 https://compute.gnx/ >/dev/null 2>&1 || return 1
+  curl --fail --silent --connect-timeout 1 --max-time 2 --cacert "$ca_dir/backend-ca.pem" --resolve compute.gnx:8006:127.0.0.1 https://compute.gnx:8006/ >/dev/null 2>&1
+}
+
+wait_for_runtime_ready() {
+  local output
+  # Dockurr boots a complete Proxmox node. Its own healthcheck permits a
+  # five-minute bootstrap window, so declaring this capability failed after
+  # one minute would turn a normal first boot into restart flapping.
+  for _ in {1..300}; do
+    runtime_https_ready && {
+      output=$("$runtime_dir/verify.run" --state-dir "$state_dir") || true
+      printf '%s\n' "$output"
+      return 0
+    }
+    sleep 1
+  done
+  output=$("$runtime_dir/verify.run" --state-dir "$state_dir" 2>/dev/null) || true
+  printf '%s\n' "$output"
+  return 1
+}
+
+write_compute_hostname() {
+  if [[ ! -e "$compute_hostname_file" ]]; then
+    printf 'gnx-compute\n' > "$compute_hostname_file.new"
+    chmod 0644 "$compute_hostname_file.new"
+    mv -f -- "$compute_hostname_file.new" "$compute_hostname_file"
+  fi
+  grep -qx 'gnx-compute' "$compute_hostname_file" || die PROXMOX_HOSTNAME_CHANGED
+}
+
+configure_private_dns() {
+  local ip
+  ip=$(podman exec gnx-mesh tailscale ip -4 2>/dev/null | tr -d '\r' | awk 'NF { print $1; exit }') || die MESH_IP_UNAVAILABLE
+  [[ -n "$ip" ]] || die MESH_IP_UNAVAILABLE
+  write_private_dns "$ip"
 }
 
 kvm_usable() {
@@ -91,116 +189,226 @@ kvm_usable() {
 mesh_authenticated() {
   command -v podman >/dev/null 2>&1 || return 1
   command -v python3 >/dev/null 2>&1 || return 1
-  # Tailscale's JSON is consumed through stdin so neither status data nor a
-  # potentially identifying address can enter argv or the installer output.
   podman exec gnx-mesh tailscale status --json 2>/dev/null |
     python3 -c 'import json, sys; status = json.load(sys.stdin); self_info = status.get("Self") or {}; raise SystemExit(0 if status.get("BackendState") == "Running" and self_info.get("Online") is True and self_info.get("TailscaleIPs") else 1)' >/dev/null 2>&1
 }
 
 check_prereqs() {
   [[ "$(id -u)" == 0 ]] || die ROOT_REQUIRED
-  require_cmd systemctl
-  require_cmd install
-  require_cmd grep
-  require_cmd stat
+  require_cmd systemctl; require_cmd install; require_cmd grep; require_cmd stat; require_cmd cmp
+  if [[ "$mode" == check ]]; then require_cmd openssl; fi
   [[ -d /run/systemd/system ]] || die SYSTEMD_REQUIRED
-  [[ -c /dev/net/tun ]] || die TUN_UNAVAILABLE
-  [[ -r /dev/net/tun && -w /dev/net/tun ]] || die TUN_UNAVAILABLE
+  [[ -c /dev/net/tun && -r /dev/net/tun && -w /dev/net/tun ]] || die TUN_UNAVAILABLE
+  if [[ "$mode" == check ]]; then kvm_usable || die KVM_UNAVAILABLE; fi
   if [[ "$mode" == check ]]; then
-    kvm_usable || die KVM_UNAVAILABLE
-  else
-    [[ -c /dev/kvm && -r /dev/kvm && -w /dev/kvm ]] || die KVM_UNAVAILABLE
-  fi
-  if [[ "$mode" == check ]]; then
-    require_cmd nft
-    require_cmd curl
-    require_cmd getent
-    require_cmd python3
-  fi
-  if ! command -v podman >/dev/null 2>&1 && [[ "$mode" == check ]]; then
-    die PODMAN_MISSING
+    require_cmd nft; require_cmd curl; require_cmd getent; require_cmd python3; require_cmd podman; require_podman_6
   fi
   check_image_refs
-  check_secret_path
+  [[ -z "$mesh_secret_file" ]] || check_secret_file "$mesh_secret_file" TS_AUTHKEY
+  [[ -z "$compute_secret_file" ]] || check_secret_file "$compute_secret_file" PROXMOX_PASSWORD
 }
 
 install_dependencies() {
-  if command -v podman >/dev/null 2>&1 && command -v nft >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 && command -v getent >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
-    return 0
-  fi
+  if command -v podman >/dev/null 2>&1 && podman_6_or_newer && command -v nft >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 && command -v dig >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1; then return 0; fi
   if command -v apt-get >/dev/null 2>&1; then
-    apt-get update >/dev/null 2>&1 || die PODMAN_INSTALL_FAILED
-    DEBIAN_FRONTEND=noninteractive apt-get install -y podman nftables curl libc-bin python3 >/dev/null 2>&1 || die PODMAN_INSTALL_FAILED
+    apt-get update >/dev/null 2>&1 || die DEPENDENCY_INSTALL_FAILED
+    DEBIAN_FRONTEND=noninteractive apt-get install -y podman nftables curl dnsutils libc-bin python3 openssl kmod >/dev/null 2>&1 || die DEPENDENCY_INSTALL_FAILED
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y podman nftables curl glibc-common python3 >/dev/null 2>&1 || die PODMAN_INSTALL_FAILED
-  else
-    die PODMAN_INSTALL_UNSUPPORTED
+    dnf install -y podman nftables curl bind-utils glibc-common python3 openssl kmod >/dev/null 2>&1 || die DEPENDENCY_INSTALL_FAILED
+  else die DEPENDENCY_INSTALL_UNSUPPORTED; fi
+  require_cmd podman; require_podman_6; require_cmd nft; require_cmd curl; require_cmd dig; require_cmd python3; require_cmd openssl; require_cmd modprobe
+}
+
+load_kvm() {
+  local arch
+  require_cmd modprobe
+  modprobe kvm >/dev/null 2>&1 || die KVM_MODULE_LOAD_FAILED
+  if modprobe kvm_amd >/dev/null 2>&1; then arch=kvm_amd
+  elif modprobe kvm_intel >/dev/null 2>&1; then arch=kvm_intel
+  else die KVM_MODULE_LOAD_FAILED
   fi
-  require_cmd podman
-  require_cmd nft
-  require_cmd curl
-  require_cmd getent
-  require_cmd python3
+  install -d -m 0755 /etc/modules-load.d
+  printf 'kvm\n%s\n' "$arch" > /etc/modules-load.d/gnx-node-kvm.conf
+  chmod 0644 /etc/modules-load.d/gnx-node-kvm.conf
+  kvm_usable || die KVM_UNAVAILABLE
+}
+
+make_ca() {
+  local ca_name=$1 subject=$2
+  if [[ ! -s "$private_ca_dir/$ca_name.key" && ! -s "$ca_dir/$ca_name.pem" ]]; then
+    openssl req -x509 -newkey rsa:3072 -nodes -days 3650 \
+      -keyout "$private_ca_dir/$ca_name.key" -out "$ca_dir/$ca_name.pem" \
+      -subj "$subject" >/dev/null 2>&1 || die CA_GENERATION_FAILED
+  elif [[ ! -s "$private_ca_dir/$ca_name.key" || ! -s "$ca_dir/$ca_name.pem" ]]; then
+    die CA_MATERIAL_INCOMPLETE
+  fi
+  chmod 0600 "$private_ca_dir/$ca_name.key"; chmod 0644 "$ca_dir/$ca_name.pem"
+}
+
+make_leaf() {
+  local ca_name=$1 leaf_name=$2 subject=$3 sans=$4
+  [[ -s "$ca_dir/$leaf_name-cert.pem" && -s "$ca_dir/$leaf_name-key.pem" ]] && return 0
+  if [[ -s "$ca_dir/$leaf_name-cert.pem" || -s "$ca_dir/$leaf_name-key.pem" ]]; then die CERT_MATERIAL_INCOMPLETE; fi
+  [[ -s "$private_ca_dir/$ca_name.key" && -s "$ca_dir/$ca_name.pem" ]] || die CA_SIGNING_KEY_MISSING
+  local csr="$private_ca_dir/$leaf_name.csr" ext="$private_ca_dir/$leaf_name.ext" serial="$private_ca_dir/$leaf_name.srl"
+  printf 'subjectAltName=%s\n' "$sans" > "$ext"
+  openssl req -new -newkey rsa:2048 -nodes -keyout "$ca_dir/$leaf_name-key.pem" -out "$csr" -subj "$subject" >/dev/null 2>&1 || die CERT_GENERATION_FAILED
+  openssl x509 -req -days 825 -in "$csr" -CA "$ca_dir/$ca_name.pem" -CAkey "$private_ca_dir/$ca_name.key" -CAcreateserial -CAserial "$serial" -out "$ca_dir/$leaf_name-cert.pem" -extfile "$ext" >/dev/null 2>&1 || die CERT_GENERATION_FAILED
+  rm -f -- "$csr" "$ext" "$serial"
+  chmod 0600 "$ca_dir/$leaf_name-key.pem"; chmod 0644 "$ca_dir/$leaf_name-cert.pem"
+}
+
+generate_ca_material() {
+  install -d -m 0755 "$ca_dir"; install -d -m 0700 "$private_ca_dir"
+  # Provision creates the product CA in state_dir and exposes its public
+  # certificate through Progress. Use that exact CA for gateway TLS so the
+  # operator action and the served certificate cannot diverge.
+  local host_ca_cert="$state_dir/ca/private-ca.cert.pem" host_ca_key="$state_dir/ca/private-ca.key.pem"
+  if [[ -s "$host_ca_cert" && -s "$host_ca_key" ]]; then
+    if [[ ! -s "$ca_dir/gateway-ca.pem" ]] || ! cmp -s "$host_ca_cert" "$ca_dir/gateway-ca.pem" || [[ ! -s "$private_ca_dir/gateway-ca.key" ]] || ! cmp -s "$host_ca_key" "$private_ca_dir/gateway-ca.key"; then
+      install -m 0644 "$host_ca_cert" "$ca_dir/gateway-ca.pem"
+      install -m 0600 "$host_ca_key" "$private_ca_dir/gateway-ca.key"
+      rm -f -- "$ca_dir/gateway-cert.pem" "$ca_dir/gateway-key.pem"
+    fi
+  elif [[ -e "$host_ca_cert" || -e "$host_ca_key" ]]; then
+    die PRODUCT_CA_INCOMPLETE
+  else
+    make_ca gateway-ca '/CN=GnX Node Private Gateway CA'
+  fi
+  make_leaf gateway-ca gateway '/CN=GnX Node Gateway' 'DNS:app.gnx,DNS:compute.gnx'
+  make_ca backend-ca '/CN=GnX Node Private Backend CA'
+  make_leaf backend-ca backend '/CN=GnX Node Compute Backend' 'DNS:compute.gnx'
+  openssl verify -CAfile "$ca_dir/gateway-ca.pem" "$ca_dir/gateway-cert.pem" >/dev/null 2>&1 || die GATEWAY_CA_INVALID
+  openssl verify -CAfile "$ca_dir/backend-ca.pem" "$ca_dir/backend-cert.pem" >/dev/null 2>&1 || die BACKEND_CA_INVALID
 }
 
 check_prereqs
-if [[ "$mode" == check ]]; then
-  emit check_ok
-  exit 0
-fi
-install_dependencies
-kvm_usable || die KVM_UNAVAILABLE
-
-unit_dir=/etc/containers/systemd
-runtime_dir=/var/lib/gnx-node
-install -d -m 0755 "$unit_dir" "$runtime_dir" "$state_dir"
-chmod 0700 "$state_dir"
-install -d -m 0700 "$runtime_dir/mesh" "$runtime_dir/dns" "$runtime_dir/compute"
-install -d -m 0755 "$runtime_dir/ca"
-install -d -m 0755 "$runtime_dir/web-app"
+if [[ "$mode" == check ]]; then emit check_ok; exit 0; fi
+# Acquire the install lock before creating, replacing, or cleaning the mesh key.
 install -d -m 0700 /run/gnx-node
+if command -v flock >/dev/null 2>&1; then exec 9>/run/gnx-node/install.lock; flock -n 9 || die INSTALL_IN_PROGRESS; fi
+cleanup() {
+  if [[ -d /run/gnx-node ]]; then
+    : > /run/gnx-node/mesh.env
+    chmod 0600 /run/gnx-node/mesh.env
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
+install_dependencies
+load_kvm
+install -m 0600 /dev/null /run/gnx-node/mesh.env
+cat > /etc/tmpfiles.d/gnx-node.conf <<'EOF'
+d /run/gnx-node 0700 root root -
+f /run/gnx-node/mesh.env 0600 root root -
+EOF
+chmod 0644 /etc/tmpfiles.d/gnx-node.conf
+install -d -m 0755 /etc/containers/systemd "$runtime_dir"
+# The Windows host creates and ACLs its drvfs state tree. Do not pass that
+# existing directory to install(1): -m attempts a forbidden chmod on drvfs.
+if [[ ! -d "$state_dir" ]]; then
+  install -d -m 0700 "$state_dir"
+else
+  case "$state_dir" in /mnt/?/*) ;; *) chmod 0700 "$state_dir" ;; esac
+fi
+install -d -m 0700 "$runtime_dir/mesh" "$runtime_dir/dns" "$runtime_dir/compute" "$compute_config_dir" "$compute_hook_dir" "$secret_dir"
+install -d -m 0755 "$dnsmasq_dir" "$compute_systemd_dir/pveproxy.service.d"
+write_compute_hostname
+generate_ca_material
+install -d -m 0755 "$runtime_dir/web-app"
+install -m 0755 "$payload_dir/compute/install-tls.sh" "$compute_hook_dir/install-tls.sh"
+cat > "$compute_systemd_dir/pveproxy.service.d/gnx.conf" <<'EOF'
+[Unit]
+After=pve-cluster.service
+Requires=pve-cluster.service
+[Service]
+ExecStartPre=/usr/local/libexec/gnx-install-tls.sh
+EOF
+chmod 0644 "$compute_systemd_dir/pveproxy.service.d/gnx.conf"
 
-# Materialise only immutable payload files. Re-running replaces the same units,
-# while state and externally managed CA remain intact.
-for unit in mesh dns gateway compute; do
-  install -m 0644 "$payload_dir/services/$unit.container" "$unit_dir/$unit.container"
-done
-install -m 0644 "$payload_dir/services/platform.target" "$unit_dir/platform.target"
+for unit in mesh dns gateway compute; do install -m 0644 "$payload_dir/services/$unit.container" "/etc/containers/systemd/$unit.container"; done
+install -m 0644 "$payload_dir/services/platform.target" /etc/systemd/system/platform.target
+install -m 0644 "$payload_dir/services/gnx-ingress.service" /etc/systemd/system/gnx-ingress.service
 install -m 0644 "$payload_dir/gateway/routes.conf" "$runtime_dir/routes.conf"
 install -m 0644 "$payload_dir/network/ingress.nft" "$runtime_dir/ingress.nft"
 install -m 0755 "$payload_dir/verify.run" "$runtime_dir/verify.run"
-
-# The application is a payload asset, not a mutable container volume.
 find "$runtime_dir/web-app" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 cp -a "$payload_dir/web-app/." "$runtime_dir/web-app/"
 chmod -R a-w "$runtime_dir/web-app"
 
-secret_staged=0
-if [[ -n "$mesh_secret_file" ]]; then
-  install -m 0600 "$mesh_secret_file" /run/gnx-node/mesh.env
-  secret_staged=1
+if [[ -n "$compute_secret_file" ]]; then
+  write_compute_secret "$compute_secret_file"
+elif [[ ! -f "$secret_dir/compute.env" ]]; then
+  die PROXMOX_SECRET_REQUIRED
+elif grep -Eq '^PROXMOX_PASSWORD=.+$' "$secret_dir/compute.env"; then
+  # Migrate the pre-adapter format without exposing the value in argv.
+  write_compute_secret "$secret_dir/compute.env"
+else
+  check_runtime_password_file "$secret_dir/compute.env"
 fi
 
-# Validate before replacing the live ruleset, then replace only this table.
+install -m 0600 /dev/null /run/gnx-node/mesh.env
+if [[ -n "$mesh_secret_file" ]]; then
+  check_secret_file "$mesh_secret_file" TS_AUTHKEY
+  install -m 0600 "$mesh_secret_file" /run/gnx-node/mesh.env
+  mesh_staged=1
+fi
 nft -c -f "$runtime_dir/ingress.nft" >/dev/null 2>&1 || die NFT_INVALID
-nft delete table inet gnx_ingress >/dev/null 2>&1 || true
-nft -f "$runtime_dir/ingress.nft" >/dev/null 2>&1 || die NFT_APPLY_FAILED
-
 systemctl daemon-reload
-systemctl enable --now platform.target >/dev/null 2>&1 || die PLATFORM_START_FAILED
+systemctl enable --now gnx-ingress.service >/dev/null 2>&1 || die NFT_APPLY_FAILED
+# Quadlet applies mesh.container's WantedBy=multi-user.target during generation.
+# Enrollment is a real readiness boundary: before the mesh has an authenticated
+# kernel interface, DNS cannot safely bind its private listener and the rest of
+# the platform must remain stopped.
+if ((mesh_staged)); then
+  # A new one-shot credential is read only at container creation.
+  systemctl restart mesh.service >/dev/null 2>&1 || die MESH_START_FAILED
+elif ! systemctl is-active --quiet mesh.service; then
+  # Never bounce an authenticated mesh merely to reconcile the platform. In
+  # particular, an operator-supplied ephemeral node would be deleted offline.
+  systemctl start mesh.service >/dev/null 2>&1 || die MESH_START_FAILED
+fi
+for _ in {1..60}; do
+  systemctl is-active --quiet mesh.service && break
+  sleep 1
+done
+systemctl is-active --quiet mesh.service || die MESH_START_FAILED
 
-# A supplied enrollment key is usable only during the first mesh start. It is
-# staged in /run (tmpfs) and removed after systemd accepts mesh.service;
-# persistent mesh state is in the service volume, never the key.
-if ((secret_staged)); then
+if ((mesh_staged)); then
+  wait_for_mesh_auth || die MESH_AUTHENTICATION_FAILED
+elif ! wait_for_mesh_auth; then
+  # Keep an already-enabled target enabled. A temporary mesh-auth race must
+  # not turn a reboot into a permanently disabled node.
+  systemctl stop platform.target >/dev/null 2>&1 || true
+  systemctl stop dns.service gateway.service compute.service >/dev/null 2>&1 || true
+  rm -f -- "$dnsmasq_dir/02-gnx.conf"
+  printf '%s\n' '{"event":"installed","mesh":"pending","next_actions":["Provide a Tailscale enrollment file and rerun install."]}'
+  emit installed
+  exit 0
+fi
+if mesh_authenticated; then
+  configure_private_dns
+  systemctl enable platform.target >/dev/null 2>&1 || die PLATFORM_ENABLE_FAILED
+  if systemctl is-active --quiet platform.target; then
+    systemctl restart dns.service gateway.service compute.service >/dev/null 2>&1 || die PLATFORM_RESTART_FAILED
+  else
+    systemctl start platform.target >/dev/null 2>&1 || die PLATFORM_START_FAILED
+  fi
   for _ in {1..60}; do
-    systemctl is-active --quiet mesh.service && mesh_authenticated && break
+    all_active=1
+    for unit in mesh dns gateway compute; do systemctl is-active --quiet "$unit.service" || all_active=0; done
+    ((all_active)) && break
     sleep 1
   done
-  if ! systemctl is-active --quiet mesh.service; then
-    die MESH_START_FAILED
-  fi
-  mesh_authenticated || die MESH_AUTHENTICATION_FAILED
-  rm -f -- /run/gnx-node/mesh.env
+  for unit in mesh dns gateway compute; do systemctl is-active --quiet "$unit.service" || die "${unit^^}_START_FAILED"; done
+  verify_output=$(wait_for_runtime_ready) || { printf '%s\n' "$verify_output"; die VERIFY_FAILED; }
+  printf '%s\n' "$verify_output"
+else
+  # Keep an already-enabled target enabled. A temporary mesh-auth race must
+  # not turn a reboot into a permanently disabled node.
+  systemctl stop platform.target >/dev/null 2>&1 || true
+  systemctl stop dns.service gateway.service compute.service >/dev/null 2>&1 || true
+  rm -f -- "$dnsmasq_dir/02-gnx.conf"
+  printf '%s\n' '{"event":"installed","mesh":"pending","next_actions":["Provide a Tailscale enrollment file and rerun install."]}'
 fi
 emit installed
