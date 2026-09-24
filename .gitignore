@@ -1,6 +1,9 @@
 /build/
 /target/
 *.msi
+# Published installer artifacts are intentionally kept in Hugging Face releases.
+!releases/
+!releases/**/*.msi
 *.wixpdb
 *.wixobj
 *.log
