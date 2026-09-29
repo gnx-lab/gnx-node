@@ -92,7 +92,15 @@ if (isTrustedLocalSetup && onboarding && onboardingForm) {
 }
 
 if (isTrustedAppOrigin && 'serviceWorker' in navigator) {
+  let reloadingForUpdate = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (reloadingForUpdate) return;
+    reloadingForUpdate = true;
+    window.location.reload();
+  });
   window.addEventListener('load', () => {
-    void navigator.serviceWorker.register('./sw.js', { scope: './' });
+    void navigator.serviceWorker
+      .register('./sw.js', { scope: './', updateViaCache: 'none' })
+      .then(registration => registration.update());
   });
 }
